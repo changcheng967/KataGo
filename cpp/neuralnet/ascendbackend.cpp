@@ -12,6 +12,7 @@
 #include "aclnn/aclnn_adaptive_avg_pool2d.h"
 #include "aclnn/aclnn_cast.h"
 #include "aclnn/aclnn_fill_scalar.h"
+#include "aclnn/aclnn_inplace_fill_scalar.h"
 #include "aclnn/aclnn_copy.h"
 #include "aclnn/aclnn_inplace_mul.h"
 #include "aclnn/aclnn_inplace_add.h"
@@ -2001,9 +2002,25 @@ void Model::applyValueHead(
   //   mean, max, and mean * sqrt(area) concatenated
   // We need to implement this properly or create a custom kernel
 
-  // For now, zero-initialize v1MeanBuf as a placeholder
-  size_t v1MeanBytes = batchSize * v1Channels * 3 * sizeof(float);
-  aclrtMemset(v1MeanBuf, v1MeanBytes, 0, v1MeanBytes);
+  // For now, zero-initialize v1MeanBuf using aclnnFillScalar
+  {
+    aclTensor* v1MeanTensor = createAclTensor(v1MeanBuf, {batchSize, v1Channels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclScalar* zeroScalar = aclCreateScalar(0.0f, ACL_FLOAT);
+
+    uint64_t fillWsSize = 0;
+    aclOpExecutor* fillExecutor = nullptr;
+    aclnnStatus status = aclnnInplaceFillScalarGetWorkspaceSize(v1MeanTensor, zeroScalar, &fillWsSize, &fillExecutor);
+    if(status == ACLNN_SUCCESS) {
+      status = aclnnInplaceFillScalar(workspaceBuf, fillWsSize, fillExecutor, stream);
+    }
+
+    aclDestroyTensor(v1MeanTensor);
+    aclDestroyScalar(zeroScalar);
+
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnInplaceFillScalar failed for v1MeanBuf with error: " + to_string(status));
+    }
+  }
 
   // Step 4: Apply v2Mul: v1Mean -> v2Out
   v2Mul->apply(stream, batchSize, v1MeanBuf, v2OutBuf, workspaceBuf, workspaceBytes);
