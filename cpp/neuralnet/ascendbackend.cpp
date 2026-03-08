@@ -27,10 +27,14 @@
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/activations.h"
 
-#include "../core/simpleallocator.h"
 #include "../core/test.h"
 
 using namespace std;
+
+// ACLNN_SUCCESS is 0 on CANN 8.3
+#ifndef ACLNN_SUCCESS
+#define ACLNN_SUCCESS 0
+#endif
 
 //---------------------------------------------------------------------------------
 // Ascend NPU Backend for KataGo
@@ -73,6 +77,9 @@ using namespace std;
 
 // Helper to create an aclTensor from raw device pointer
 // shape is in NCHW format (batch, channels, height, width) or (batch, channels) for 2D
+// CANN 8.3 aclCreateTensor signature:
+//   aclCreateTensor(viewDims, viewDimsNum, dataType, storageDims, storageDimsNum,
+//                   storageOffset, format, strides, stridesNum, data)
 static aclTensor* createAclTensor(
   void* data,
   const vector<int64_t>& shape,
@@ -83,42 +90,20 @@ static aclTensor* createAclTensor(
     return nullptr;
   }
 
-  // Compute strides from shape and format
+  // Compute contiguous strides
   vector<int64_t> strides(shape.size());
-  if(format == ACL_FORMAT_NCHW && shape.size() == 4) {
-    // NCHW: stride[0] = C*H*W, stride[1] = H*W, stride[2] = W, stride[3] = 1
-    strides[0] = shape[1] * shape[2] * shape[3];
-    strides[1] = shape[2] * shape[3];
-    strides[2] = shape[3];
-    strides[3] = 1;
-  } else if(format == ACL_FORMAT_NCHW && shape.size() == 2) {
-    // NC: stride[0] = C, stride[1] = 1
-    strides[0] = shape[1];
-    strides[1] = 1;
-  } else if(format == ACL_FORMAT_ND) {
-    // Generic ND format - compute contiguous strides
-    strides[shape.size() - 1] = 1;
-    for(int i = (int)shape.size() - 2; i >= 0; i--) {
-      strides[i] = strides[i + 1] * shape[i + 1];
-    }
-  } else {
-    // Default to contiguous strides
-    strides[shape.size() - 1] = 1;
-    for(int i = (int)shape.size() - 2; i >= 0; i--) {
-      strides[i] = strides[i + 1] * shape[i + 1];
-    }
+  strides[shape.size() - 1] = 1;
+  for(int i = (int)shape.size() - 2; i >= 0; i--) {
+    strides[i] = strides[i + 1] * shape[i + 1];
   }
 
   aclTensor* tensor = aclCreateTensor(
-    shape.data(),
-    static_cast<uint64_t>(shape.size()),
+    shape.data(), static_cast<uint64_t>(shape.size()),  // viewDims, viewDimsNum
     dtype,
+    shape.data(), static_cast<uint64_t>(shape.size()),  // storageDims, storageDimsNum
+    0,                                                   // storageOffset
     format,
-    strides.data(),
-    static_cast<uint64_t>(strides.size()),
-    0,  // offset
-    shape.data(),
-    static_cast<uint64_t>(shape.size()),
+    strides.data(), static_cast<uint64_t>(strides.size()), // strides, stridesNum
     data
   );
 
@@ -130,8 +115,13 @@ static aclScalar* createAclScalar(float value, aclDataType dtype) {
   return aclCreateScalar(&value, dtype);
 }
 
+// Helper to create a float scalar with ACL_FLOAT type
+static aclScalar* createFloatScalar(float value) {
+  return aclCreateScalar(&value, ACL_FLOAT);
+}
+
 static aclScalar* createAclScalarInt(int64_t value) {
-  return aclCreateScalar(&value, ACL_DT_INT64);
+  return aclCreateScalar(&value, ACL_INT64);
 }
 
 // Helper to destroy an aclTensor
@@ -144,11 +134,6 @@ static void destroyAclTensor(aclTensor* tensor) {
 // Helper to create aclIntArray
 static aclIntArray* createAclIntArray(const vector<int64_t>& values) {
   return aclCreateIntArray(values.data(), static_cast<uint64_t>(values.size()));
-}
-
-// Helper to create aclBoolArray
-static aclBoolArray* createAclBoolArray(const vector<bool>& values) {
-  return aclCreateBoolArray(values.data(), static_cast<uint64_t>(values.size()));
 }
 
 //---------------------------------------------------------------------------------
@@ -212,7 +197,7 @@ static void ascendCopyFloatToHalf(aclrtStream stream, void* dstHalf, const float
   // Create tensor for float input
   vector<int64_t> shape = {static_cast<int64_t>(numElts)};
   aclTensor* floatTensor = createAclTensor(nullptr, shape, ACL_FLOAT, ACL_FORMAT_ND);
-  aclTensor* halfTensor = createAclTensor(nullptr, shape, ACL_DT_UNDEFINED, ACL_FORMAT_ND); // Will be set by cast
+  aclTensor* halfTensor = createAclTensor(nullptr, shape, ACL_FLOAT16, ACL_FORMAT_ND);
 
   // Actually, for the conversion, we need to use the workspace-based approach
   // This is a placeholder - in practice, we'd use a custom kernel or aclnnCast properly
@@ -225,6 +210,8 @@ static void ascendCopyFloatToHalf(aclrtStream stream, void* dstHalf, const float
   (void)srcFloat;
   (void)workspace;
   (void)workspaceSize;
+  (void)floatTensor;
+  (void)halfTensor;
 
   // TODO: Implement proper float->half conversion using ACLNN
 }
@@ -506,45 +493,68 @@ struct ScratchBuffers {
   const size_t batchXYBytes;
   const size_t batchBytes;
 
-  SimpleAllocator<void*>* allocator;
+  const int maxBatchSize;
+  const int nnXLen;
+  const int nnYLen;
+  const bool useFP16;
 
   // Pre-allocated workspace for ACLNN operations
   void* workspaceBuf;
   size_t workspaceBytes;
 
+  // Track allocated buffers for cleanup
+  vector<void*> allocatedBuffers;
+
   ScratchBuffers() = delete;
   ScratchBuffers(const ScratchBuffers&) = delete;
   ScratchBuffers& operator=(const ScratchBuffers&) = delete;
 
-  ScratchBuffers(int maxBatchSize, int nnXLen, int nnYLen, bool useFP16, size_t maxWorkspaceNeeded)
-    : batchXYFloatBytes((size_t)maxBatchSize * nnXLen * nnYLen * sizeof(float)),
-      batchFloatBytes((size_t)maxBatchSize * sizeof(float)),
-      batchXYBytes((size_t)maxBatchSize * nnXLen * nnYLen * (useFP16 ? sizeof(aclFloat16) : sizeof(float))),
-      batchBytes((size_t)maxBatchSize * (useFP16 ? sizeof(aclFloat16) : sizeof(float)))
+  ScratchBuffers(int maxBatchSz, int nnX, int nnY, bool fp16, size_t maxWorkspaceNeeded)
+    : batchXYFloatBytes((size_t)maxBatchSz * nnX * nnY * sizeof(float)),
+      batchFloatBytes((size_t)maxBatchSz * sizeof(float)),
+      batchXYBytes((size_t)maxBatchSz * nnX * nnY * (fp16 ? sizeof(aclFloat16) : sizeof(float))),
+      batchBytes((size_t)maxBatchSz * (fp16 ? sizeof(aclFloat16) : sizeof(float))),
+      maxBatchSize(maxBatchSz),
+      nnXLen(nnX),
+      nnYLen(nnY),
+      useFP16(fp16),
+      workspaceBuf(nullptr),
+      workspaceBytes(0)
   {
-    std::function<void*(size_t)> allocateFunc = [](size_t size) {
-      return ascendMalloc(size);
-    };
-    std::function<void(void*)> releaseFunc = [](void* buf) {
-      ascendFree(buf);
-    };
-
-    allocator = new SimpleAllocator<void*>(allocateFunc, releaseFunc);
-
     // Pre-allocate workspace
     workspaceBytes = maxWorkspaceNeeded;
     if(workspaceBytes > 0) {
       workspaceBuf = ascendMalloc(workspaceBytes);
-    } else {
-      workspaceBuf = nullptr;
     }
   }
 
   ~ScratchBuffers() {
+    // Free any allocated buffers
+    for(void* buf : allocatedBuffers) {
+      ascendFree(buf);
+    }
     if(workspaceBuf != nullptr) {
       ascendFree(workspaceBuf);
     }
-    delete allocator;
+  }
+
+  // Allocate a buffer of the given size and track it for cleanup
+  void* allocate(size_t size) {
+    void* buf = ascendMalloc(size);
+    allocatedBuffers.push_back(buf);
+    return buf;
+  }
+
+  // Release tracking for a buffer (does not free immediately, just removes from tracking)
+  void release(void* buf) {
+    // Find and remove from tracking (buffer will be freed in destructor)
+    for(auto it = allocatedBuffers.begin(); it != allocatedBuffers.end(); ++it) {
+      if(*it == buf) {
+        allocatedBuffers.erase(it);
+        ascendFree(buf);
+        return;
+      }
+    }
   }
 
   size_t getBufSizeXY(int channels) const {
@@ -713,7 +723,7 @@ struct ConvLayer {
       dilationX(desc->dilationX),
       useFP16(useFP16_)
   {
-    dtype = useFP16 ? ACL_DT_UNDEFINED : ACL_FLOAT; // ACL_DT_UNDEFINED for FP16, but we'll use ACL_FLOAT for now
+    dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
 
     // Allocate and copy weights to device
     // KataGo weights are in (outC, inC, H, W) format which is NCHW-compatible
@@ -750,27 +760,30 @@ struct ConvLayer {
     int paddingX = (convXSize / 2) * dilationX;
 
     // Create arrays for convolution parameters
-    aclIntArray* strides = createAclIntArray({1, 1});
-    aclIntArray* paddings = createAclIntArray({paddingY, paddingX});
-    aclIntArray* dilations = createAclIntArray({dilationY, dilationX});
-    aclBoolArray* outputMask = createAclBoolArray({false});
+    aclIntArray* stridesArr = createAclIntArray({1, 1});
+    aclIntArray* paddingsArr = createAclIntArray({paddingY, paddingX});
+    aclIntArray* dilationsArr = createAclIntArray({dilationY, dilationX});
+    aclIntArray* outputPaddingArr = createAclIntArray({0, 0});
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
 
+    // CANN 8.3 signature:
+    // aclnnConvolutionGetWorkspaceSize(input, weight, bias, stride, padding, dilation,
+    //                                   transposed, outputPadding, groups, output,
+    //                                   cubeMathType, workspaceSize, executor)
     aclnnStatus status = aclnnConvolutionGetWorkspaceSize(
       inputTensor,
       weightTensor,
-      nullptr,  // bias
-      strides,
-      paddings,
-      dilations,
-      false,    // transposed
-      paddings, // output padding
-      1,        // groups
-      outputMask,
-      0,        // unused
+      nullptr,        // bias
+      stridesArr,
+      paddingsArr,
+      dilationsArr,
+      false,          // transposed
+      outputPaddingArr,
+      (int64_t)1,     // groups
       outputTensor,
+      (int8_t)0,      // cubeMathType = KEEP_DTYPE
       &workspaceSize,
       &executor
     );
@@ -779,10 +792,10 @@ struct ConvLayer {
     destroyAclTensor(inputTensor);
     destroyAclTensor(weightTensor);
     destroyAclTensor(outputTensor);
-    aclDestroyIntArray(strides);
-    aclDestroyIntArray(paddings);
-    aclDestroyIntArray(dilations);
-    aclDestroyBoolArray(outputMask);
+    aclDestroyIntArray(stridesArr);
+    aclDestroyIntArray(paddingsArr);
+    aclDestroyIntArray(dilationsArr);
+    aclDestroyIntArray(outputPaddingArr);
 
     if(status != ACLNN_SUCCESS) {
       // Return a conservative estimate
@@ -833,10 +846,10 @@ struct ConvLayer {
     int paddingX = (convXSize / 2) * dilationX;
 
     // Create arrays for convolution parameters
-    aclIntArray* strides = createAclIntArray({1, 1});
-    aclIntArray* paddings = createAclIntArray({paddingY, paddingX});
-    aclIntArray* dilations = createAclIntArray({dilationY, dilationX});
-    aclBoolArray* outputMask = createAclBoolArray({false});
+    aclIntArray* stridesArr = createAclIntArray({1, 1});
+    aclIntArray* paddingsArr = createAclIntArray({paddingY, paddingX});
+    aclIntArray* dilationsArr = createAclIntArray({dilationY, dilationX});
+    aclIntArray* outputPaddingArr = createAclIntArray({0, 0});
 
     // Phase 1: Get workspace size
     uint64_t wsSize = 0;
@@ -845,16 +858,15 @@ struct ConvLayer {
     aclnnStatus status = aclnnConvolutionGetWorkspaceSize(
       inputTensor,
       weightTensor,
-      nullptr,  // bias
-      strides,
-      paddings,
-      dilations,
-      false,    // transposed
-      paddings, // output padding
-      1,        // groups
-      outputMask,
-      0,        // unused
+      nullptr,        // bias
+      stridesArr,
+      paddingsArr,
+      dilationsArr,
+      false,          // transposed
+      outputPaddingArr,
+      (int64_t)1,     // groups
       outputTensor,
+      (int8_t)0,      // cubeMathType = KEEP_DTYPE
       &wsSize,
       &executor
     );
@@ -863,10 +875,10 @@ struct ConvLayer {
       destroyAclTensor(inputTensor);
       destroyAclTensor(weightTensor);
       destroyAclTensor(outputTensor);
-      aclDestroyIntArray(strides);
-      aclDestroyIntArray(paddings);
-      aclDestroyIntArray(dilations);
-      aclDestroyBoolArray(outputMask);
+      aclDestroyIntArray(stridesArr);
+      aclDestroyIntArray(paddingsArr);
+      aclDestroyIntArray(dilationsArr);
+      aclDestroyIntArray(outputPaddingArr);
       throw StringError("aclnnConvolutionGetWorkspaceSize failed for layer " + name + " with error: " + to_string(status));
     }
 
@@ -877,10 +889,10 @@ struct ConvLayer {
     destroyAclTensor(inputTensor);
     destroyAclTensor(weightTensor);
     destroyAclTensor(outputTensor);
-    aclDestroyIntArray(strides);
-    aclDestroyIntArray(paddings);
-    aclDestroyIntArray(dilations);
-    aclDestroyBoolArray(outputMask);
+    aclDestroyIntArray(stridesArr);
+    aclDestroyIntArray(paddingsArr);
+    aclDestroyIntArray(dilationsArr);
+    aclDestroyIntArray(outputPaddingArr);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnConvolution failed for layer " + name + " with error: " + to_string(status));
@@ -990,14 +1002,16 @@ struct BatchNormLayer {
 
       aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
       aclTensor* biasTensor = createAclTensor(mergedBiasBuf, biasShape, dtype, ACL_FORMAT_ND);
+      aclScalar* alpha = createFloatScalar(1.0f);
 
       uint64_t addWsSize = 0;
       aclOpExecutor* addExecutor = nullptr;
 
-      aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, biasTensor, outputTensor, &addWsSize, &addExecutor);
+      aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, biasTensor, alpha, outputTensor, &addWsSize, &addExecutor);
       if(status != ACLNN_SUCCESS) {
         destroyAclTensor(outputTensor);
         destroyAclTensor(biasTensor);
+        aclDestroyScalar(alpha);
         throw StringError("aclnnAddGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
@@ -1005,11 +1019,13 @@ struct BatchNormLayer {
       if(status != ACLNN_SUCCESS) {
         destroyAclTensor(outputTensor);
         destroyAclTensor(biasTensor);
+        aclDestroyScalar(alpha);
         throw StringError("aclnnAdd failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
       destroyAclTensor(outputTensor);
       destroyAclTensor(biasTensor);
+      aclDestroyScalar(alpha);
     }
 
     // Step 3: Apply activation (relu if needed)
@@ -1226,22 +1242,20 @@ struct MatBiasLayer {
     vector<int64_t> outputShape = {batchSize, numChannels};
     aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
 
-    // Create scalars for alpha and beta (alpha * self + beta * other)
-    aclScalar* alpha = createAclScalar(1.0f, dtype);
-    aclScalar* beta = createAclScalar(1.0f, dtype);
+    // Create scalar for alpha (out = self + alpha * other)
+    aclScalar* alpha = createFloatScalar(1.0f);
 
     // Phase 1: Get workspace size
     uint64_t wsSize = 0;
     aclOpExecutor* executor = nullptr;
 
-    aclnnStatus status = aclnnAddGetWorkspaceSize(inputTensor, biasTensor, outputTensor, &wsSize, &executor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(inputTensor, biasTensor, alpha, outputTensor, &wsSize, &executor);
 
     if(status != ACLNN_SUCCESS) {
       destroyAclTensor(inputTensor);
       destroyAclTensor(biasTensor);
       destroyAclTensor(outputTensor);
       aclDestroyScalar(alpha);
-      aclDestroyScalar(beta);
       throw StringError("aclnnAddGetWorkspaceSize failed for MatBias " + name + " with error: " + to_string(status));
     }
 
@@ -1251,7 +1265,6 @@ struct MatBiasLayer {
       destroyAclTensor(biasTensor);
       destroyAclTensor(outputTensor);
       aclDestroyScalar(alpha);
-      aclDestroyScalar(beta);
       throw StringError("MatBias " + name + " requires more workspace: " + to_string(wsSize) + " > " + to_string(workspaceBytes));
     }
 
@@ -1263,7 +1276,6 @@ struct MatBiasLayer {
     destroyAclTensor(biasTensor);
     destroyAclTensor(outputTensor);
     aclDestroyScalar(alpha);
-    aclDestroyScalar(beta);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for MatBias " + name + " with error: " + to_string(status));
@@ -1331,6 +1343,7 @@ struct ResidualBlock {
   unique_ptr<NormActConv> midNormActConv;
   unique_ptr<ConvLayer> finalConv;
   int numChannels;
+  bool useFP16;
 
   ResidualBlock() = delete;
   ResidualBlock(const ResidualBlock&) = delete;
@@ -1340,13 +1353,13 @@ struct ResidualBlock {
     const ResidualBlockDesc* desc,
     int nnXLen,
     int nnYLen,
-    bool useFP16
-  ) : name(desc->name), numChannels(desc->finalConv.outChannels)
+    bool useFP16_
+  ) : name(desc->name), numChannels(desc->finalConv.outChannels), useFP16(useFP16_)
   {
     preNormActConv = make_unique<NormActConv>(
-      &desc->preBN, &desc->preActivation, &desc->regularConv, nnXLen, nnYLen, useFP16);
+      &desc->preBN, &desc->preActivation, &desc->regularConv, nnXLen, nnYLen, useFP16_);
     midNormActConv = make_unique<NormActConv>(
-      &desc->midBN, &desc->midActivation, &desc->finalConv, nnXLen, nnYLen, useFP16);
+      &desc->midBN, &desc->midActivation, &desc->finalConv, nnXLen, nnYLen, useFP16_);
   }
 
   size_t requiredWorkspaceBytes(int batchSize, int nnXLen, int nnYLen, aclrtStream stream) const {
@@ -1393,16 +1406,20 @@ struct ResidualBlock {
     vector<int64_t> resultShape = {batchSize, numChannels, nnYLen, nnXLen};
     aclTensor* resultTensor = createAclTensor(outputBuf, resultShape, dtype, ACL_FORMAT_NCHW);
 
+    // Create scalar for alpha
+    aclScalar* alpha = createFloatScalar(1.0f);
+
     // Phase 1: Get workspace size for add
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
 
-    aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, residualTensor, resultTensor, &addWsSize, &addExecutor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, residualTensor, alpha, resultTensor, &addWsSize, &addExecutor);
 
     if(status != ACLNN_SUCCESS) {
       destroyAclTensor(outputTensor);
       destroyAclTensor(residualTensor);
       destroyAclTensor(resultTensor);
+      aclDestroyScalar(alpha);
       throw StringError("aclnnAddGetWorkspaceSize failed for ResidualBlock " + name + " with error: " + to_string(status));
     }
 
@@ -1413,6 +1430,7 @@ struct ResidualBlock {
     destroyAclTensor(outputTensor);
     destroyAclTensor(residualTensor);
     destroyAclTensor(resultTensor);
+    aclDestroyScalar(alpha);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for ResidualBlock " + name + " with error: " + to_string(status));
@@ -1762,9 +1780,9 @@ void Model::apply(
   size_t workspaceBytes
 ) const {
   // Allocate intermediate buffers from scratch
-  void* trunkOutputBuf = scratch->allocator->allocate(scratch->getBufSizeXY(trunkNumChannels));
-  void* maskBuf = scratch->allocator->allocate(scratch->getBufSizeXY(1));
-  void* scratchBuf = scratch->allocator->allocate(scratch->getBufSizeXY(trunkNumChannels));
+  void* trunkOutputBuf = scratch->allocate(scratch->getBufSizeXY(trunkNumChannels));
+  void* maskBuf = scratch->allocate(scratch->getBufSizeXY(1));
+  void* scratchBuf = scratch->allocate(scratch->getBufSizeXY(trunkNumChannels));
 
   // Apply trunk
   applyTrunk(stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
@@ -1776,9 +1794,9 @@ void Model::apply(
   applyValueHead(stream, batchSize, trunkOutputBuf, maskBuf, valueBuf, scoreValueBuf, ownershipBuf, scratchBuf, workspaceBuf, workspaceBytes);
 
   // Release scratch buffers
-  scratch->allocator->release(scratchBuf);
-  scratch->allocator->release(maskBuf);
-  scratch->allocator->release(trunkOutputBuf);
+  scratch->release(scratchBuf);
+  scratch->release(maskBuf);
+  scratch->release(trunkOutputBuf);
 
   (void)requireExactNNLen;
 }
@@ -1824,11 +1842,14 @@ void Model::applyTrunk(
   aclTensor* biasTensor = createAclTensor(globalMulBuf, biasShape, dtype, ACL_FORMAT_ND);
   aclTensor* resultTensor = createAclTensor(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
 
+  // Create scalar for alpha
+  aclScalar* alpha = createFloatScalar(1.0f);
+
   // Phase 1: Get workspace size for add
   uint64_t addWsSize = 0;
   aclOpExecutor* addExecutor = nullptr;
 
-  aclnnStatus status = aclnnAddGetWorkspaceSize(trunkTensor, biasTensor, resultTensor, &addWsSize, &addExecutor);
+  aclnnStatus status = aclnnAddGetWorkspaceSize(trunkTensor, biasTensor, alpha, resultTensor, &addWsSize, &addExecutor);
 
   if(status == ACLNN_SUCCESS) {
     // Phase 2: Execute add
@@ -1839,6 +1860,7 @@ void Model::applyTrunk(
   destroyAclTensor(trunkTensor);
   destroyAclTensor(biasTensor);
   destroyAclTensor(resultTensor);
+  aclDestroyScalar(alpha);
 
   if(status != ACLNN_SUCCESS) {
     throw StringError("aclnnAdd failed for initial global features with error: " + to_string(status));
@@ -1889,12 +1911,12 @@ void Model::applyPolicyHead(
   int g1Channels = g1Conv->outChannels;
 
   // Allocate intermediate buffers from scratch
-  void* p1OutBuf = scratch->allocator->allocate(scratch->getBufSizeXY(p1Channels));
-  void* g1OutBuf = scratch->allocator->allocate(scratch->getBufSizeXY(g1Channels));
-  void* g1Out2Buf = scratch->allocator->allocate(scratch->getBufSizeXY(g1Channels));
-  void* g1ConcatBuf = scratch->allocator->allocate(scratch->getBufSizeFloat(g1Channels * 3));
-  void* g1BiasBuf = scratch->allocator->allocate(scratch->getBufSizeFloat(p1Channels));
-  void* p1PassBuf = scratch->allocator->allocate(scratch->getBufSizeFloat(p1Channels));
+  void* p1OutBuf = scratch->allocate(scratch->getBufSizeXY(p1Channels));
+  void* g1OutBuf = scratch->allocate(scratch->getBufSizeXY(g1Channels));
+  void* g1Out2Buf = scratch->allocate(scratch->getBufSizeXY(g1Channels));
+  void* g1ConcatBuf = scratch->allocate(scratch->getBufSizeFloat(g1Channels * 3));
+  void* g1BiasBuf = scratch->allocate(scratch->getBufSizeFloat(p1Channels));
+  void* p1PassBuf = scratch->allocate(scratch->getBufSizeFloat(p1Channels));
 
   // Step 1: Apply p1Conv: trunk -> p1Out
   p1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
@@ -1923,10 +1945,11 @@ void Model::applyPolicyHead(
     aclTensor* p1OutTensor = createAclTensor(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
     aclTensor* biasTensor = createAclTensor(g1BiasBuf, biasShape, dtype, ACL_FORMAT_ND);
     aclTensor* resultTensor = createAclTensor(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
+    aclScalar* alpha = createFloatScalar(1.0f);
 
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
-    aclnnStatus status = aclnnAddGetWorkspaceSize(p1OutTensor, biasTensor, resultTensor, &addWsSize, &addExecutor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(p1OutTensor, biasTensor, alpha, resultTensor, &addWsSize, &addExecutor);
     if(status == ACLNN_SUCCESS && addWsSize <= workspaceBytes) {
       aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
     }
@@ -1934,6 +1957,7 @@ void Model::applyPolicyHead(
     destroyAclTensor(p1OutTensor);
     destroyAclTensor(biasTensor);
     destroyAclTensor(resultTensor);
+    aclDestroyScalar(alpha);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for policy head bias with error: " + to_string(status));
@@ -1959,12 +1983,12 @@ void Model::applyPolicyHead(
   }
 
   // Release intermediate buffers
-  scratch->allocator->release(p1PassBuf);
-  scratch->allocator->release(g1BiasBuf);
-  scratch->allocator->release(g1ConcatBuf);
-  scratch->allocator->release(g1Out2Buf);
-  scratch->allocator->release(g1OutBuf);
-  scratch->allocator->release(p1OutBuf);
+  scratch->release(p1PassBuf);
+  scratch->release(g1BiasBuf);
+  scratch->release(g1ConcatBuf);
+  scratch->release(g1Out2Buf);
+  scratch->release(g1OutBuf);
+  scratch->release(p1OutBuf);
 
   (void)dtype;
 }
@@ -1987,11 +2011,11 @@ void Model::applyValueHead(
   int ownershipChannels = vOwnershipConv->outChannels;
 
   // Allocate intermediate buffers from scratch
-  void* v1OutBuf = scratch->allocator->allocate(scratch->getBufSizeXY(v1Channels));
-  void* v1Out2Buf = scratch->allocator->allocate(scratch->getBufSizeXY(v1Channels));
-  void* v1MeanBuf = scratch->allocator->allocate(scratch->getBufSizeFloat(v1Channels * 3));  // mean, max, sqrt-area
-  void* v2OutBuf = scratch->allocator->allocate(scratch->getBufSizeFloat(v2Channels));
-  void* ownershipScratchBuf = scratch->allocator->allocate(scratch->getBufSizeXY(ownershipChannels));
+  void* v1OutBuf = scratch->allocate(scratch->getBufSizeXY(v1Channels));
+  void* v1Out2Buf = scratch->allocate(scratch->getBufSizeXY(v1Channels));
+  void* v1MeanBuf = scratch->allocate(scratch->getBufSizeFloat(v1Channels * 3));  // mean, max, sqrt-area
+  void* v2OutBuf = scratch->allocate(scratch->getBufSizeFloat(v2Channels));
+  void* ownershipScratchBuf = scratch->allocate(scratch->getBufSizeXY(ownershipChannels));
 
   // Step 1: Apply v1Conv: trunk -> v1Out
   v1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), v1OutBuf, workspaceBuf, workspaceBytes);
@@ -2066,11 +2090,11 @@ void Model::applyValueHead(
   }
 
   // Release intermediate buffers
-  scratch->allocator->release(ownershipScratchBuf);
-  scratch->allocator->release(v2OutBuf);
-  scratch->allocator->release(v1MeanBuf);
-  scratch->allocator->release(v1Out2Buf);
-  scratch->allocator->release(v1OutBuf);
+  scratch->release(ownershipScratchBuf);
+  scratch->release(v2OutBuf);
+  scratch->release(v1MeanBuf);
+  scratch->release(v1Out2Buf);
+  scratch->release(v1OutBuf);
 
   (void)dtype;
 }
