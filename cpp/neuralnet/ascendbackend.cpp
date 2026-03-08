@@ -1199,16 +1199,72 @@ struct MatBiasLayer {
     aclrtStream stream,
     int batchSize,
     void* inputBuf,
-    void* outputBuf
+    void* outputBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
   ) const {
     // Add bias: output = input + bias
+    // input: (batch, numChannels), bias: (numChannels,), output: (batch, numChannels)
+    // Bias needs to be broadcast across the batch dimension
 
-    (void)stream;
-    (void)batchSize;
-    (void)inputBuf;
-    (void)outputBuf;
+    aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
 
-    // TODO: Implement using aclnnAdd
+    // Create input tensor: (N, C)
+    vector<int64_t> inputShape = {batchSize, numChannels};
+    aclTensor* inputTensor = createAclTensor(inputBuf, inputShape, dtype, ACL_FORMAT_ND);
+
+    // Create bias tensor: (C,) - will be broadcast
+    vector<int64_t> biasShape = {numChannels};
+    aclTensor* biasTensor = createAclTensor(biasBuf, biasShape, dtype, ACL_FORMAT_ND);
+
+    // Create output tensor: (N, C)
+    vector<int64_t> outputShape = {batchSize, numChannels};
+    aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
+
+    // Create scalars for alpha and beta (alpha * self + beta * other)
+    aclScalar* alpha = createAclScalar(1.0f, dtype);
+    aclScalar* beta = createAclScalar(1.0f, dtype);
+
+    // Phase 1: Get workspace size
+    uint64_t wsSize = 0;
+    aclOpExecutor* executor = nullptr;
+
+    aclnnStatus status = aclnnAddGetWorkspaceSize(inputTensor, biasTensor, outputTensor, &wsSize, &executor);
+
+    if(status != ACLNN_SUCCESS) {
+      destroyAclTensor(inputTensor);
+      destroyAclTensor(biasTensor);
+      destroyAclTensor(outputTensor);
+      aclDestroyScalar(alpha);
+      aclDestroyScalar(beta);
+      throw StringError("aclnnAddGetWorkspaceSize failed for MatBias " + name + " with error: " + to_string(status));
+    }
+
+    // Verify workspace is sufficient
+    if(wsSize > workspaceBytes) {
+      destroyAclTensor(inputTensor);
+      destroyAclTensor(biasTensor);
+      destroyAclTensor(outputTensor);
+      aclDestroyScalar(alpha);
+      aclDestroyScalar(beta);
+      throw StringError("MatBias " + name + " requires more workspace: " + to_string(wsSize) + " > " + to_string(workspaceBytes));
+    }
+
+    // Phase 2: Execute
+    status = aclnnAdd(workspaceBuf, wsSize, executor, stream);
+
+    // Cleanup
+    destroyAclTensor(inputTensor);
+    destroyAclTensor(biasTensor);
+    destroyAclTensor(outputTensor);
+    aclDestroyScalar(alpha);
+    aclDestroyScalar(beta);
+
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnAdd failed for MatBias " + name + " with error: " + to_string(status));
+    }
+
+    (void)workspaceBytes;
   }
 };
 
