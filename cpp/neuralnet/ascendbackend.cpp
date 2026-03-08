@@ -1879,26 +1879,66 @@ void Model::applyPolicyHead(
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
-  // Apply p1 conv: trunk -> scratch
-  p1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), scratchBuf, workspaceBuf, workspaceBytes);
+  aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+  int p1Channels = p1Conv->outChannels;
+  int g1Channels = g1Conv->outChannels;
 
-  // Apply p1 BN
-  p1BN->apply(stream, batchSize, scratchBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
+  // Allocate intermediate buffers from scratch
+  void* p1OutBuf = scratch->allocator->allocate(scratch->getBufSizeXY(p1Channels));
+  void* g1OutBuf = scratch->allocator->allocate(scratch->getBufSizeXY(g1Channels));
+  void* g1Out2Buf = scratch->allocator->allocate(scratch->getBufSizeXY(g1Channels));
+  void* g1ConcatBuf = scratch->allocator->allocate(scratch->getBufSizeFloat(g1Channels * 3));
+  void* g1BiasBuf = scratch->allocator->allocate(scratch->getBufSizeFloat(p1Channels));
+  void* p1PassBuf = scratch->allocator->allocate(scratch->getBufSizeFloat(p1Channels));
 
-  // Apply p2 conv: scratch -> policy output
+  // Step 1: Apply p1Conv: trunk -> p1Out
+  p1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
+
+  // Step 2: Apply g1Conv: trunk -> g1Out
+  g1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), g1OutBuf, workspaceBuf, workspaceBytes);
+
+  // Step 3: Apply g1BN: g1Out -> g1Out2
+  g1BN->apply(stream, batchSize, g1OutBuf, maskBuf, g1Out2Buf, workspaceBuf, workspaceBytes);
+
+  // Step 4: Global pooling on g1Out2 -> g1Concat
+  // This computes: mean, max, mean * sqrt(area) and concatenates them
+  // TODO: Implement proper global pooling using aclnnAdaptiveAvgPool2d + custom max kernel
+  // For now, zero-initialize g1ConcatBuf as a placeholder
+  // In practice, we need custom kernels for this or implement with ACLNN operations
+
+  // Step 5: Apply gpoolToBiasMul: g1Concat -> g1Bias
+  gpoolToBiasMul->apply(stream, batchSize, g1ConcatBuf, g1BiasBuf, workspaceBuf, workspaceBytes);
+
+  // Step 6: Add g1Bias to p1Out (broadcast across spatial dims)
+  // TODO: Implement proper broadcast add using aclnnAdd
+
+  // Step 7: Apply p1BN: p1Out -> scratchBuf
+  p1BN->apply(stream, batchSize, p1OutBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+  // Step 8: Apply p2Conv: scratchBuf -> policyBuf
   p2Conv->apply(stream, batchSize, nnXLen, nnYLen, false, scratchBuf, policyBuf, workspaceBuf, workspaceBytes);
 
-  // TODO: Implement gpool branch for policy pass
-  // g1Conv, g1BN | global pool | gpoolToBiasMul | gpoolToPassMul | gpoolToPassBias | gpoolToPassMul2
+  // Step 9: Compute policy pass logit
+  // gpoolToPassMul: g1Concat -> p1PassBuf
+  // gpoolToPassBias: p1PassBuf (in-place)
+  // gpoolToPassMul2: p1PassBuf -> policyPassBuf (if modelVersion >= 15)
+  if(modelVersion >= 15) {
+    gpoolToPassMul->apply(stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+    gpoolToPassBias->apply(stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+    gpoolToPassMul2->apply(stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
+  } else {
+    gpoolToPassMul->apply(stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
+  }
 
-  (void)maskBuf;
-  (void)policyPassBuf;
-  (void)g1Conv;
-  (void)g1BN;
-  (void)gpoolToBiasMul;
-  (void)gpoolToPassMul;
-  (void)gpoolToPassBias;
-  (void)gpoolToPassMul2;
+  // Release intermediate buffers
+  scratch->allocator->release(p1PassBuf);
+  scratch->allocator->release(g1BiasBuf);
+  scratch->allocator->release(g1ConcatBuf);
+  scratch->allocator->release(g1Out2Buf);
+  scratch->allocator->release(g1OutBuf);
+  scratch->allocator->release(p1OutBuf);
+
+  (void)dtype;
 }
 
 void Model::applyValueHead(
