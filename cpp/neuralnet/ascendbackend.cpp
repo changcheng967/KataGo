@@ -2220,13 +2220,76 @@ void NeuralNet::getOutput(
       ascendCopyH2D(buffers->inputMetaBuf, inputBuffers->userInputMetaBuffer, inputBuffers->singleInputMetaBytes * batchSize);
     }
   } else {
-    // For FP16 mode, copy to float buffer first, then convert
+    // For FP16 mode, copy to float buffer first, then convert to FP16
     ascendCopyH2D(buffers->inputBufFloat, inputBuffers->userInputBuffer, inputBuffers->singleInputBytes * batchSize);
     ascendCopyH2D(buffers->inputGlobalBufFloat, inputBuffers->userInputGlobalBuffer, inputBuffers->singleInputGlobalBytes * batchSize);
     if(numMetaFeatures > 0) {
       ascendCopyH2D(buffers->inputMetaBufFloat, inputBuffers->userInputMetaBuffer, inputBuffers->singleInputMetaBytes * batchSize);
     }
-    // TODO: Convert float to FP16 on device
+
+    // Convert float to FP16 on device using aclnnCast
+    size_t spatialElts = (size_t)batchSize * numSpatialFeatures * nnXLen * nnYLen;
+    size_t globalElts = (size_t)batchSize * numGlobalFeatures;
+
+    // Convert spatial input
+    {
+      aclTensor* srcTensor = createAclTensor(buffers->inputBufFloat,
+        {batchSize, numSpatialFeatures, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      aclTensor* dstTensor = createAclTensor(buffers->inputBuf,
+        {batchSize, numSpatialFeatures, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
+
+      uint64_t castWsSize = 0;
+      aclOpExecutor* castExecutor = nullptr;
+      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, dstTensor, &castWsSize, &castExecutor);
+      if(status == ACLNN_SUCCESS) {
+        status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
+      }
+      destroyAclTensor(srcTensor);
+      destroyAclTensor(dstTensor);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnCast failed for spatial input with error: " + to_string(status));
+      }
+    }
+
+    // Convert global input
+    {
+      aclTensor* srcTensor = createAclTensor(buffers->inputGlobalBufFloat,
+        {batchSize, numGlobalFeatures}, ACL_FLOAT, ACL_FORMAT_ND);
+      aclTensor* dstTensor = createAclTensor(buffers->inputGlobalBuf,
+        {batchSize, numGlobalFeatures}, ACL_FLOAT16, ACL_FORMAT_ND);
+
+      uint64_t castWsSize = 0;
+      aclOpExecutor* castExecutor = nullptr;
+      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, dstTensor, &castWsSize, &castExecutor);
+      if(status == ACLNN_SUCCESS) {
+        status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
+      }
+      destroyAclTensor(srcTensor);
+      destroyAclTensor(dstTensor);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnCast failed for global input with error: " + to_string(status));
+      }
+    }
+
+    // Convert meta input if present
+    if(numMetaFeatures > 0) {
+      aclTensor* srcTensor = createAclTensor(buffers->inputMetaBufFloat,
+        {batchSize, numMetaFeatures}, ACL_FLOAT, ACL_FORMAT_ND);
+      aclTensor* dstTensor = createAclTensor(buffers->inputMetaBuf,
+        {batchSize, numMetaFeatures}, ACL_FLOAT16, ACL_FORMAT_ND);
+
+      uint64_t castWsSize = 0;
+      aclOpExecutor* castExecutor = nullptr;
+      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, dstTensor, &castWsSize, &castExecutor);
+      if(status == ACLNN_SUCCESS) {
+        status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
+      }
+      destroyAclTensor(srcTensor);
+      destroyAclTensor(dstTensor);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnCast failed for meta input with error: " + to_string(status));
+      }
+    }
   }
 
   // Run model inference
