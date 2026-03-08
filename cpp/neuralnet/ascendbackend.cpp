@@ -1910,7 +1910,30 @@ void Model::applyPolicyHead(
   gpoolToBiasMul->apply(stream, batchSize, g1ConcatBuf, g1BiasBuf, workspaceBuf, workspaceBytes);
 
   // Step 6: Add g1Bias to p1Out (broadcast across spatial dims)
-  // TODO: Implement proper broadcast add using aclnnAdd
+  // g1Bias is (batch, p1Channels), p1Out is (batch, p1Channels, nnYLen, nnXLen)
+  {
+    vector<int64_t> p1OutShape = {batchSize, p1Channels, nnYLen, nnXLen};
+    vector<int64_t> biasShape = {batchSize, p1Channels};
+
+    aclTensor* p1OutTensor = createAclTensor(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* biasTensor = createAclTensor(g1BiasBuf, biasShape, dtype, ACL_FORMAT_ND);
+    aclTensor* resultTensor = createAclTensor(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
+
+    uint64_t addWsSize = 0;
+    aclOpExecutor* addExecutor = nullptr;
+    aclnnStatus status = aclnnAddGetWorkspaceSize(p1OutTensor, biasTensor, resultTensor, &addWsSize, &addExecutor);
+    if(status == ACLNN_SUCCESS && addWsSize <= workspaceBytes) {
+      aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+    }
+
+    destroyAclTensor(p1OutTensor);
+    destroyAclTensor(biasTensor);
+    destroyAclTensor(resultTensor);
+
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnAdd failed for policy head bias with error: " + to_string(status));
+    }
+  }
 
   // Step 7: Apply p1BN: p1Out -> scratchBuf
   p1BN->apply(stream, batchSize, p1OutBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
