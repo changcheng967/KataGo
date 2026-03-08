@@ -1104,17 +1104,69 @@ struct MatMulLayer {
     aclrtStream stream,
     int batchSize,
     void* inputBuf,
-    void* outputBuf
+    void* outputBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
   ) const {
-    // Matrix multiplication: output = input @ weights
+    // Matrix multiplication: output = input @ weights^T
     // input: (batch, inC), weights: (inC, outC), output: (batch, outC)
+    // Note: KataGo stores weights in (inC, outC) format
+    // For matmul with input (N, inC) @ weights (inC, outC) -> output (N, outC)
 
-    (void)stream;
-    (void)batchSize;
-    (void)inputBuf;
-    (void)outputBuf;
+    aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
 
-    // TODO: Implement using aclnnMatmul
+    // Create input tensor: (N, inC)
+    vector<int64_t> inputShape = {batchSize, inChannels};
+    aclTensor* inputTensor = createAclTensor(inputBuf, inputShape, dtype, ACL_FORMAT_ND);
+
+    // Create weight tensor: (inC, outC)
+    vector<int64_t> weightShape = {inChannels, outChannels};
+    aclTensor* weightTensor = createAclTensor(matBuf, weightShape, dtype, ACL_FORMAT_ND);
+
+    // Create output tensor: (N, outC)
+    vector<int64_t> outputShape = {batchSize, outChannels};
+    aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
+
+    // Phase 1: Get workspace size
+    uint64_t wsSize = 0;
+    aclOpExecutor* executor = nullptr;
+
+    aclnnStatus status = aclnnMatmulGetWorkspaceSize(
+      inputTensor,
+      weightTensor,
+      outputTensor,
+      &wsSize,
+      &executor
+    );
+
+    if(status != ACLNN_SUCCESS) {
+      destroyAclTensor(inputTensor);
+      destroyAclTensor(weightTensor);
+      destroyAclTensor(outputTensor);
+      throw StringError("aclnnMatmulGetWorkspaceSize failed for MatMul " + name + " with error: " + to_string(status));
+    }
+
+    // Verify workspace is sufficient
+    if(wsSize > workspaceBytes) {
+      destroyAclTensor(inputTensor);
+      destroyAclTensor(weightTensor);
+      destroyAclTensor(outputTensor);
+      throw StringError("MatMul " + name + " requires more workspace: " + to_string(wsSize) + " > " + to_string(workspaceBytes));
+    }
+
+    // Phase 2: Execute
+    status = aclnnMatmul(workspaceBuf, wsSize, executor, stream);
+
+    // Cleanup
+    destroyAclTensor(inputTensor);
+    destroyAclTensor(weightTensor);
+    destroyAclTensor(outputTensor);
+
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnMatmul failed for MatMul " + name + " with error: " + to_string(status));
+    }
+
+    (void)workspaceBytes;
   }
 };
 
