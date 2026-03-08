@@ -1358,19 +1358,62 @@ struct ResidualBlock {
     int nnYLen,
     const void* maskBuf,
     void* inputBuf,
+    void* outputBuf,
     void* scratchBuf,
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
-    // Apply pre NormActConv: input -> scratch
-    preNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, scratchBuf, workspaceBuf, workspaceBytes);
+    // Copy input to scratch as residual backup
+    // We need to preserve the original input for the residual connection
+    size_t trunkBytes = numChannels * batchSize * nnXLen * nnYLen * sizeof(float);
+    ascendCopyD2D(scratchBuf, inputBuf, trunkBytes);  // scratch = input (save for residual)
 
-    // Apply mid NormActConv: scratch -> scratch (in-place BN then conv)
-    midNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, scratchBuf, scratchBuf, workspaceBuf, workspaceBytes);
+    // Apply pre NormActConv: input -> input (in-place for BN part, then conv to output)
+    // But we need a separate buffer, so: input -> output
+    preNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, outputBuf, workspaceBuf, workspaceBytes);
 
-    // Add residual: scratch + input -> input (output)
-    // TODO: Implement using aclnnAdd
-    // For now, this is simplified - the residual add is critical
+    // Apply mid NormActConv: output -> output (in-place BN then conv)
+    midNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, outputBuf, outputBuf, workspaceBuf, workspaceBytes);
+
+    // Add residual: output + scratch -> output
+    // This is the key step - add the saved residual to the transformed output
+    aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+
+    // Create tensors for addition
+    vector<int64_t> addShape = {batchSize, numChannels, nnYLen, nnXLen};
+    aclTensor* outputTensor = createAclTensor(outputBuf, addShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* residualTensor = createAclTensor(scratchBuf, addShape, dtype, ACL_FORMAT_NCHW);
+
+    // Create output tensor for the result
+    vector<int64_t> resultShape = {batchSize, numChannels, nnYLen, nnXLen};
+    aclTensor* resultTensor = createAclTensor(outputBuf, resultShape, dtype, ACL_FORMAT_NCHW);
+
+    // Phase 1: Get workspace size for add
+    uint64_t addWsSize = 0;
+    aclOpExecutor* addExecutor = nullptr;
+
+    aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, residualTensor, resultTensor, &addWsSize, &addExecutor);
+
+    if(status != ACLNN_SUCCESS) {
+      destroyAclTensor(outputTensor);
+      destroyAclTensor(residualTensor);
+      destroyAclTensor(resultTensor);
+      throw StringError("aclnnAddGetWorkspaceSize failed for ResidualBlock " + name + " with error: " + to_string(status));
+    }
+
+    // Phase 2: Execute add
+    status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+
+    // Cleanup
+    destroyAclTensor(outputTensor);
+    destroyAclTensor(residualTensor);
+    destroyAclTensor(resultTensor);
+
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnAdd failed for ResidualBlock " + name + " with error: " + to_string(status));
+    }
+
+    (void)workspaceBytes;
   }
 };
 
