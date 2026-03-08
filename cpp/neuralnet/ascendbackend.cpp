@@ -1790,16 +1790,68 @@ void Model::applyTrunk(
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
-  // Extract mask from input channel 0
-  // TODO: Implement mask extraction using aclnn indexing
-
   // Apply initial convolution: input -> trunkOutput
   initialConv->apply(stream, batchSize, nnXLen, nnYLen, false, inputBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
 
-  // TODO: Apply initial matmul with global features
-  // This adds the global features to the trunk output
-  (void)inputGlobalBuf;
+  // Apply initial matmul with global features
+  // This adds the global features (and optional metadata features) to trunkOutput
+  // The global features are broadcast and added to each spatial location
+  // KataGo: trunkOutput += inputGlobalBuf @ initialMatMul
+
+  // Allocate temporary buffer for matmul result
+  void* globalMulBuf = scratchBuf;  // Reuse scratch buffer for intermediate result
+
+  // Apply matmul: (batch, numGlobalChannels) @ (numGlobalChannels, trunkChannels) -> (batch, trunkChannels)
+  initialMatMul->apply(stream, batchSize, inputGlobalBuf, globalMulBuf, workspaceBuf, workspaceBytes);
+
+  // Add globalMulBuf to each spatial location of trunkOutput
+  // trunkOutput is (batch, trunkChannels, nnYLen, nnXLen)
+  // globalMulBuf is (batch, trunkChannels)
+  // Need to broadcast add: trunkOutput += globalMulBuf[:, :, None, None]
+
+  aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+
+  // Create tensors for add with broadcasting
+  vector<int64_t> trunkShape = {batchSize, trunkNumChannels, nnYLen, nnXLen};
+  vector<int64_t> biasShape = {batchSize, trunkNumChannels};  // Will be broadcast
+
+  aclTensor* trunkTensor = createAclTensor(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
+  aclTensor* biasTensor = createAclTensor(globalMulBuf, biasShape, dtype, ACL_FORMAT_ND);
+  aclTensor* resultTensor = createAclTensor(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
+
+  // Phase 1: Get workspace size for add
+  uint64_t addWsSize = 0;
+  aclOpExecutor* addExecutor = nullptr;
+
+  aclnnStatus status = aclnnAddGetWorkspaceSize(trunkTensor, biasTensor, resultTensor, &addWsSize, &addExecutor);
+
+  if(status == ACLNN_SUCCESS) {
+    // Phase 2: Execute add
+    status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+  }
+
+  // Cleanup
+  destroyAclTensor(trunkTensor);
+  destroyAclTensor(biasTensor);
+  destroyAclTensor(resultTensor);
+
+  if(status != ACLNN_SUCCESS) {
+    throw StringError("aclnnAdd failed for initial global features with error: " + to_string(status));
+  }
+
+  // TODO: Handle metadata features if present
   (void)inputMetaBuf;
+  (void)hasMetadataEncoder;
+  (void)metaMul1;
+  (void)metaBias1;
+  (void)metaMul2;
+  (void)metaBias2;
+  (void)metaMul3;
+
+  // Extract mask from input channel 0
+  // The mask is stored in the first channel of the input
+  // TODO: Implement mask extraction using aclnn indexing or stride
+  (void)maskBuf;
 
   // Apply residual blocks
   for(const auto& block : residualBlocks) {
@@ -1807,7 +1859,8 @@ void Model::applyTrunk(
   }
 
   // Apply global pooling residual blocks
-  // TODO: Implement with mask sum buffer
+  // These require mask sum buffer for proper global pooling
+  // TODO: Implement gpoolBlocks with maskSumBuf
 
   // Apply trunk tip BN
   trunkTipBN->apply(stream, batchSize, trunkOutputBuf, maskBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
