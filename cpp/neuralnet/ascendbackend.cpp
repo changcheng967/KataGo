@@ -2005,7 +2005,7 @@ void Model::applyValueHead(
   // For now, zero-initialize v1MeanBuf using aclnnFillScalar
   {
     aclTensor* v1MeanTensor = createAclTensor(v1MeanBuf, {batchSize, v1Channels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
-    aclScalar* zeroScalar = aclCreateScalar(0.0f, ACL_FLOAT);
+    aclScalar* zeroScalar = createAclScalar(0.0f, ACL_FLOAT);
 
     uint64_t fillWsSize = 0;
     aclOpExecutor* fillExecutor = nullptr;
@@ -2014,7 +2014,7 @@ void Model::applyValueHead(
       status = aclnnInplaceFillScalar(workspaceBuf, fillWsSize, fillExecutor, stream);
     }
 
-    aclDestroyTensor(v1MeanTensor);
+    destroyAclTensor(v1MeanTensor);
     aclDestroyScalar(zeroScalar);
 
     if(status != ACLNN_SUCCESS) {
