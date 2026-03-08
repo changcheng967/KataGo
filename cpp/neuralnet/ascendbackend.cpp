@@ -1269,7 +1269,194 @@ struct MatBiasLayer {
 };
 
 //---------------------------------------------------------------------------------
-// Model Structure (placeholder for full implementation)
+// Composite Layer Implementations
+//---------------------------------------------------------------------------------
+
+// NormActConv - BatchNorm + Activation + Conv fused pattern
+struct NormActConv {
+  const string name;
+  unique_ptr<BatchNormLayer> bnLayer;
+  unique_ptr<ConvLayer> convLayer;
+  int numChannels;
+
+  NormActConv() = delete;
+  NormActConv(const NormActConv&) = delete;
+  NormActConv& operator=(const NormActConv&) = delete;
+
+  NormActConv(
+    const BatchNormLayerDesc* bnDesc,
+    const ActivationLayerDesc* actDesc,
+    const ConvLayerDesc* convDesc,
+    int nnXLen,
+    int nnYLen,
+    bool useFP16
+  ) : name(bnDesc->name + "_" + convDesc->name), numChannels(convDesc->outChannels)
+  {
+    bnLayer = make_unique<BatchNormLayer>(bnDesc, actDesc, nnXLen, nnYLen, useFP16);
+    convLayer = make_unique<ConvLayer>(convDesc, useFP16);
+  }
+
+  size_t requiredWorkspaceBytes(int batchSize, int nnXLen, int nnYLen, aclrtStream stream) const {
+    return convLayer->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream);
+  }
+
+  void apply(
+    aclrtStream stream,
+    int batchSize,
+    int nnXLen,
+    int nnYLen,
+    const void* maskBuf,
+    void* inputBuf,
+    void* outputBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const {
+    // Apply BN + activation in-place on input
+    bnLayer->apply(stream, batchSize, inputBuf, maskBuf, inputBuf, workspaceBuf, workspaceBytes);
+
+    // Then apply convolution
+    convLayer->apply(stream, batchSize, nnXLen, nnYLen, false, inputBuf, outputBuf, workspaceBuf, workspaceBytes);
+  }
+};
+
+// ResidualBlock - Two NormActConvs with residual addition
+struct ResidualBlock {
+  const string name;
+  unique_ptr<NormActConv> preNormActConv;
+  unique_ptr<NormActConv> midNormActConv;
+  unique_ptr<ConvLayer> finalConv;
+  int numChannels;
+
+  ResidualBlock() = delete;
+  ResidualBlock(const ResidualBlock&) = delete;
+  ResidualBlock& operator=(const ResidualBlock&) = delete;
+
+  ResidualBlock(
+    const ResidualBlockDesc* desc,
+    int nnXLen,
+    int nnYLen,
+    bool useFP16
+  ) : name(desc->name), numChannels(desc->finalConv.outChannels)
+  {
+    preNormActConv = make_unique<NormActConv>(
+      &desc->preBN, &desc->preActivation, &desc->regularConv, nnXLen, nnYLen, useFP16);
+    midNormActConv = make_unique<NormActConv>(
+      &desc->midBN, &desc->midActivation, &desc->finalConv, nnXLen, nnYLen, useFP16);
+  }
+
+  size_t requiredWorkspaceBytes(int batchSize, int nnXLen, int nnYLen, aclrtStream stream) const {
+    size_t bytes = 0;
+    bytes = max(bytes, preNormActConv->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
+    bytes = max(bytes, midNormActConv->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
+    return bytes;
+  }
+
+  void apply(
+    aclrtStream stream,
+    int batchSize,
+    int nnXLen,
+    int nnYLen,
+    const void* maskBuf,
+    void* inputBuf,
+    void* scratchBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const {
+    // Apply pre NormActConv: input -> scratch
+    preNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+    // Apply mid NormActConv: scratch -> scratch (in-place BN then conv)
+    midNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, scratchBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+    // Add residual: scratch + input -> input (output)
+    // TODO: Implement using aclnnAdd
+    // For now, this is simplified - the residual add is critical
+  }
+};
+
+// GlobalPoolingResidualBlock - Residual block with global pooling branch
+struct GlobalPoolingResidualBlock {
+  const string name;
+  unique_ptr<NormActConv> preNormActConv;
+  unique_ptr<ConvLayer> gpoolConv;
+  unique_ptr<BatchNormLayer> gpoolBN;
+  unique_ptr<MatMulLayer> gpoolToBiasMul;
+  unique_ptr<NormActConv> midNormActConv;
+  int numChannels;
+  int gpoolChannels;
+  int nnXLen;
+  int nnYLen;
+  bool useFP16;
+
+  GlobalPoolingResidualBlock() = delete;
+  GlobalPoolingResidualBlock(const GlobalPoolingResidualBlock&) = delete;
+  GlobalPoolingResidualBlock& operator=(const GlobalPoolingResidualBlock&) = delete;
+
+  GlobalPoolingResidualBlock(
+    const GlobalPoolingResidualBlockDesc* desc,
+    int nnX,
+    int nnY,
+    bool useFP16_
+  ) : name(desc->name),
+      numChannels(desc->finalConv.outChannels),
+      gpoolChannels(desc->gpoolConv.outChannels),
+      nnXLen(nnX),
+      nnYLen(nnY),
+      useFP16(useFP16_)
+  {
+    preNormActConv = make_unique<NormActConv>(
+      &desc->preBN, &desc->preActivation, &desc->regularConv, nnX, nnY, useFP16_);
+    gpoolConv = make_unique<ConvLayer>(&desc->gpoolConv, useFP16_);
+    gpoolBN = make_unique<BatchNormLayer>(&desc->gpoolBN, &desc->gpoolActivation, nnX, nnY, useFP16_);
+    gpoolToBiasMul = make_unique<MatMulLayer>(&desc->gpoolToBiasMul, useFP16_);
+    midNormActConv = make_unique<NormActConv>(
+      &desc->midBN, &desc->midActivation, &desc->finalConv, nnX, nnY, useFP16_);
+  }
+
+  size_t requiredWorkspaceBytes(int batchSize, aclrtStream stream) const {
+    size_t bytes = 0;
+    bytes = max(bytes, preNormActConv->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
+    bytes = max(bytes, gpoolConv->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
+    bytes = max(bytes, midNormActConv->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
+    return bytes;
+  }
+
+  void apply(
+    aclrtStream stream,
+    int batchSize,
+    const void* maskBuf,
+    const float* maskSumBuf,
+    void* inputBuf,
+    void* scratchBuf,
+    void* gpoolOutBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const {
+    // This is a complex operation with global pooling
+    // For now, simplified implementation
+
+    (void)maskSumBuf;
+    (void)gpoolOutBuf;
+
+    // Apply pre NormActConv: input -> scratch
+    preNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+    // TODO: Implement global pooling branch
+    // 1. Apply gpoolConv
+    // 2. Apply gpoolBN
+    // 3. Global average pooling
+    // 4. Apply gpoolToBiasMul
+    // 5. Add bias to scratch
+
+    // Apply mid NormActConv: scratch -> scratch
+    midNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, scratchBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+    // TODO: Add residual connection
+  }
+};
+
+//---------------------------------------------------------------------------------
+// Model Structure
 //---------------------------------------------------------------------------------
 
 struct Model {
