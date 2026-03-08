@@ -1953,33 +1953,82 @@ void Model::applyValueHead(
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
-  // Apply v1 conv: trunk -> scratch
-  v1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), scratchBuf, workspaceBuf, workspaceBytes);
+  aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+  int v1Channels = v1Conv->outChannels;
+  int v2Channels = v2Mul->outChannels;
+  int ownershipChannels = vOwnershipConv->outChannels;
 
-  // Apply v1 BN
-  v1BN->apply(stream, batchSize, scratchBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
+  // Allocate intermediate buffers from scratch
+  void* v1OutBuf = scratch->allocator->allocate(scratch->getBufSizeXY(v1Channels));
+  void* v1Out2Buf = scratch->allocator->allocate(scratch->getBufSizeXY(v1Channels));
+  void* v1MeanBuf = scratch->allocator->allocate(scratch->getBufSizeFloat(v1Channels * 3));  // mean, max, sqrt-area
+  void* v2OutBuf = scratch->allocator->allocate(scratch->getBufSizeFloat(v2Channels));
+  void* ownershipScratchBuf = scratch->allocator->allocate(scratch->getBufSizeXY(ownershipChannels));
 
-  // Global pooling for value head
-  // TODO: Implement global average pooling
+  // Step 1: Apply v1Conv: trunk -> v1Out
+  v1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), v1OutBuf, workspaceBuf, workspaceBytes);
 
-  // Apply matmul layers for value output
-  // v2Mul | v2Bias -> intermediate
-  // v3Mul | v3Bias -> valueBuf
+  // Step 2: Apply v1BN: v1Out -> v1Out2
+  v1BN->apply(stream, batchSize, v1OutBuf, maskBuf, v1Out2Buf, workspaceBuf, workspaceBytes);
 
-  // Apply matmul layers for score value output
-  // sv3Mul | sv3Bias -> scoreValueBuf
+  // Step 3: Global pooling on v1Out2 -> v1Mean
+  // TODO: Implement proper global pooling with mean, max, sqrt-area statistics
+  // For now, use aclnnAdaptiveAvgPool2d for mean only
+  // The CUDA backend uses customCudaValueHeadPoolNCHW which computes:
+  //   mean, max, and mean * sqrt(area) concatenated
+  // We need to implement this properly or create a custom kernel
 
-  // Apply ownership conv: scratch -> ownership
-  vOwnershipConv->apply(stream, batchSize, nnXLen, nnYLen, false, scratchBuf, ownershipBuf, workspaceBuf, workspaceBytes);
+  // For now, zero-initialize v1MeanBuf as a placeholder
+  size_t v1MeanBytes = batchSize * v1Channels * 3 * sizeof(float);
+  aclrtMemset(v1MeanBuf, v1MeanBytes, 0, v1MeanBytes);
 
-  (void)valueBuf;
-  (void)scoreValueBuf;
-  (void)v2Mul;
-  (void)v2Bias;
-  (void)v3Mul;
-  (void)v3Bias;
-  (void)sv3Mul;
-  (void)sv3Bias;
+  // Step 4: Apply v2Mul: v1Mean -> v2Out
+  v2Mul->apply(stream, batchSize, v1MeanBuf, v2OutBuf, workspaceBuf, workspaceBytes);
+
+  // Step 5: Apply v2Bias: v2Out -> v2Out (in-place)
+  v2Bias->apply(stream, batchSize, v2OutBuf, v2OutBuf, workspaceBuf, workspaceBytes);
+
+  // Step 6: Apply v3Mul: v2Out -> valueBuf
+  v3Mul->apply(stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
+
+  // Step 7: Apply v3Bias: valueBuf -> valueBuf (in-place)
+  v3Bias->apply(stream, batchSize, valueBuf, valueBuf, workspaceBuf, workspaceBytes);
+
+  // Step 8: Apply sv3Mul: v2Out -> scoreValueBuf
+  sv3Mul->apply(stream, batchSize, v2OutBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
+
+  // Step 9: Apply sv3Bias: scoreValueBuf -> scoreValueBuf (in-place)
+  sv3Bias->apply(stream, batchSize, scoreValueBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
+
+  // Step 10: Apply vOwnershipConv: v1Out2 -> ownershipBuf
+  // If using FP16, output to ownershipScratchBuf first, then convert to FP32
+  if(useFP16) {
+    vOwnershipConv->apply(stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipScratchBuf, workspaceBuf, workspaceBytes);
+    // Convert FP16 to FP32 for final output
+    size_t ownershipElts = batchSize * ownershipChannels * nnXLen * nnYLen;
+    aclTensor* srcTensor = createAclTensor(ownershipScratchBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
+    aclTensor* dstTensor = createAclTensor(ownershipBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
+
+    uint64_t castWsSize = 0;
+    aclOpExecutor* castExecutor = nullptr;
+    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, dstTensor, &castWsSize, &castExecutor);
+    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+      aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+    }
+    destroyAclTensor(srcTensor);
+    destroyAclTensor(dstTensor);
+  } else {
+    vOwnershipConv->apply(stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipBuf, workspaceBuf, workspaceBytes);
+  }
+
+  // Release intermediate buffers
+  scratch->allocator->release(ownershipScratchBuf);
+  scratch->allocator->release(v2OutBuf);
+  scratch->allocator->release(v1MeanBuf);
+  scratch->allocator->release(v1Out2Buf);
+  scratch->allocator->release(v1OutBuf);
+
+  (void)dtype;
 }
 
 //---------------------------------------------------------------------------------
