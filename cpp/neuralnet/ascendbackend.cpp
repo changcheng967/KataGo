@@ -77,9 +77,9 @@ using namespace std;
 
 // Helper to create an aclTensor from raw device pointer
 // shape is in NCHW format (batch, channels, height, width) or (batch, channels) for 2D
-// CANN 8.3 aclCreateTensor signature:
-//   aclCreateTensor(viewDims, viewDimsNum, dataType, storageDims, storageDimsNum,
-//                   storageOffset, format, strides, stridesNum, data)
+// CANN 8.3 aclCreateTensor signature (9 parameters):
+//   aclCreateTensor(viewDims, viewDimsNum, dataType, strides, storageOffset,
+//                   format, storageDims, storageDimsNum, data)
 static aclTensor* createAclTensor(
   void* data,
   const vector<int64_t>& shape,
@@ -98,13 +98,15 @@ static aclTensor* createAclTensor(
   }
 
   aclTensor* tensor = aclCreateTensor(
-    shape.data(), static_cast<uint64_t>(shape.size()),  // viewDims, viewDimsNum
-    dtype,
-    shape.data(), static_cast<uint64_t>(shape.size()),  // storageDims, storageDimsNum
-    0,                                                   // storageOffset
-    format,
-    strides.data(), static_cast<uint64_t>(strides.size()), // strides, stridesNum
-    data
+    shape.data(),                          // viewDims
+    static_cast<uint64_t>(shape.size()),   // viewDimsNum
+    dtype,                                 // dataType
+    strides.data(),                        // strides
+    (int64_t)0,                            // storageOffset
+    format,                                // format
+    shape.data(),                          // storageDims
+    static_cast<uint64_t>(shape.size()),   // storageDimsNum
+    data                                   // device data
   );
 
   return tensor;
@@ -1156,6 +1158,7 @@ struct MatMulLayer {
       inputTensor,
       weightTensor,
       outputTensor,
+      (int8_t)0,       // cubeMathType = KEEP_DTYPE
       &wsSize,
       &executor
     );
@@ -1613,7 +1616,6 @@ struct Model {
 
   void apply(
     aclrtStream stream,
-    ScratchBuffers* scratch,
     int batchSize,
     bool requireExactNNLen,
     void* inputBuf,
@@ -1765,7 +1767,6 @@ size_t Model::requiredWorkspaceBytes(int maxBatchSize) const {
 
 void Model::apply(
   aclrtStream stream,
-  ScratchBuffers* scratch,
   int batchSize,
   bool requireExactNNLen,
   void* inputBuf,
@@ -1779,10 +1780,15 @@ void Model::apply(
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
-  // Allocate intermediate buffers from scratch
-  void* trunkOutputBuf = scratch->allocate(scratch->getBufSizeXY(trunkNumChannels));
-  void* maskBuf = scratch->allocate(scratch->getBufSizeXY(1));
-  void* scratchBuf = scratch->allocate(scratch->getBufSizeXY(trunkNumChannels));
+  // Allocate intermediate buffers
+  size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
+  size_t trunkOutputBytes = (size_t)batchSize * trunkNumChannels * nnXLen * nnYLen * eltSize;
+  size_t maskBytes = (size_t)batchSize * 1 * nnXLen * nnYLen * eltSize;
+  size_t scratchBytes = trunkOutputBytes;
+
+  void* trunkOutputBuf = ascendMalloc(trunkOutputBytes);
+  void* maskBuf = ascendMalloc(maskBytes);
+  void* scratchBuf = ascendMalloc(scratchBytes);
 
   // Apply trunk
   applyTrunk(stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
@@ -1793,10 +1799,10 @@ void Model::apply(
   // Apply value head
   applyValueHead(stream, batchSize, trunkOutputBuf, maskBuf, valueBuf, scoreValueBuf, ownershipBuf, scratchBuf, workspaceBuf, workspaceBytes);
 
-  // Release scratch buffers
-  scratch->release(scratchBuf);
-  scratch->release(maskBuf);
-  scratch->release(trunkOutputBuf);
+  // Free intermediate buffers
+  ascendFree(scratchBuf);
+  ascendFree(maskBuf);
+  ascendFree(trunkOutputBuf);
 
   (void)requireExactNNLen;
 }
@@ -1882,7 +1888,7 @@ void Model::applyTrunk(
 
   // Apply residual blocks
   for(const auto& block : residualBlocks) {
-    block->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, trunkOutputBuf, scratchBuf, workspaceBuf, workspaceBytes);
+    block->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, trunkOutputBuf, trunkOutputBuf, scratchBuf, workspaceBuf, workspaceBytes);
   }
 
   // Apply global pooling residual blocks
@@ -1909,14 +1915,21 @@ void Model::applyPolicyHead(
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   int p1Channels = p1Conv->outChannels;
   int g1Channels = g1Conv->outChannels;
+  size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
 
-  // Allocate intermediate buffers from scratch
-  void* p1OutBuf = scratch->allocate(scratch->getBufSizeXY(p1Channels));
-  void* g1OutBuf = scratch->allocate(scratch->getBufSizeXY(g1Channels));
-  void* g1Out2Buf = scratch->allocate(scratch->getBufSizeXY(g1Channels));
-  void* g1ConcatBuf = scratch->allocate(scratch->getBufSizeFloat(g1Channels * 3));
-  void* g1BiasBuf = scratch->allocate(scratch->getBufSizeFloat(p1Channels));
-  void* p1PassBuf = scratch->allocate(scratch->getBufSizeFloat(p1Channels));
+  // Allocate intermediate buffers
+  size_t p1OutBytes = (size_t)batchSize * p1Channels * nnXLen * nnYLen * eltSize;
+  size_t g1OutBytes = (size_t)batchSize * g1Channels * nnXLen * nnYLen * eltSize;
+  size_t g1ConcatBytes = (size_t)batchSize * g1Channels * 3 * sizeof(float);
+  size_t g1BiasBytes = (size_t)batchSize * p1Channels * sizeof(float);
+  size_t p1PassBytes = (size_t)batchSize * p1Channels * sizeof(float);
+
+  void* p1OutBuf = ascendMalloc(p1OutBytes);
+  void* g1OutBuf = ascendMalloc(g1OutBytes);
+  void* g1Out2Buf = ascendMalloc(g1OutBytes);
+  void* g1ConcatBuf = ascendMalloc(g1ConcatBytes);
+  void* g1BiasBuf = ascendMalloc(g1BiasBytes);
+  void* p1PassBuf = ascendMalloc(p1PassBytes);
 
   // Step 1: Apply p1Conv: trunk -> p1Out
   p1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
@@ -1960,6 +1973,8 @@ void Model::applyPolicyHead(
     aclDestroyScalar(alpha);
 
     if(status != ACLNN_SUCCESS) {
+      ascendFree(p1OutBuf); ascendFree(g1OutBuf); ascendFree(g1Out2Buf);
+      ascendFree(g1ConcatBuf); ascendFree(g1BiasBuf); ascendFree(p1PassBuf);
       throw StringError("aclnnAdd failed for policy head bias with error: " + to_string(status));
     }
   }
@@ -1982,13 +1997,13 @@ void Model::applyPolicyHead(
     gpoolToPassMul->apply(stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
   }
 
-  // Release intermediate buffers
-  scratch->release(p1PassBuf);
-  scratch->release(g1BiasBuf);
-  scratch->release(g1ConcatBuf);
-  scratch->release(g1Out2Buf);
-  scratch->release(g1OutBuf);
-  scratch->release(p1OutBuf);
+  // Free intermediate buffers
+  ascendFree(p1PassBuf);
+  ascendFree(g1BiasBuf);
+  ascendFree(g1ConcatBuf);
+  ascendFree(g1Out2Buf);
+  ascendFree(g1OutBuf);
+  ascendFree(p1OutBuf);
 
   (void)dtype;
 }
@@ -2009,13 +2024,19 @@ void Model::applyValueHead(
   int v1Channels = v1Conv->outChannels;
   int v2Channels = v2Mul->outChannels;
   int ownershipChannels = vOwnershipConv->outChannels;
+  size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
 
-  // Allocate intermediate buffers from scratch
-  void* v1OutBuf = scratch->allocate(scratch->getBufSizeXY(v1Channels));
-  void* v1Out2Buf = scratch->allocate(scratch->getBufSizeXY(v1Channels));
-  void* v1MeanBuf = scratch->allocate(scratch->getBufSizeFloat(v1Channels * 3));  // mean, max, sqrt-area
-  void* v2OutBuf = scratch->allocate(scratch->getBufSizeFloat(v2Channels));
-  void* ownershipScratchBuf = scratch->allocate(scratch->getBufSizeXY(ownershipChannels));
+  // Allocate intermediate buffers
+  size_t v1OutBytes = (size_t)batchSize * v1Channels * nnXLen * nnYLen * eltSize;
+  size_t v1MeanBytes = (size_t)batchSize * v1Channels * 3 * sizeof(float);  // mean, max, sqrt-area
+  size_t v2OutBytes = (size_t)batchSize * v2Channels * sizeof(float);
+  size_t ownershipScratchBytes = (size_t)batchSize * ownershipChannels * nnXLen * nnYLen * eltSize;
+
+  void* v1OutBuf = ascendMalloc(v1OutBytes);
+  void* v1Out2Buf = ascendMalloc(v1OutBytes);
+  void* v1MeanBuf = ascendMalloc(v1MeanBytes);
+  void* v2OutBuf = ascendMalloc(v2OutBytes);
+  void* ownershipScratchBuf = ascendMalloc(ownershipScratchBytes);
 
   // Step 1: Apply v1Conv: trunk -> v1Out
   v1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), v1OutBuf, workspaceBuf, workspaceBytes);
@@ -2046,6 +2067,8 @@ void Model::applyValueHead(
     aclDestroyScalar(zeroScalar);
 
     if(status != ACLNN_SUCCESS) {
+      ascendFree(v1OutBuf); ascendFree(v1Out2Buf); ascendFree(v1MeanBuf);
+      ascendFree(v2OutBuf); ascendFree(ownershipScratchBuf);
       throw StringError("aclnnInplaceFillScalar failed for v1MeanBuf with error: " + to_string(status));
     }
   }
@@ -2073,13 +2096,12 @@ void Model::applyValueHead(
   if(useFP16) {
     vOwnershipConv->apply(stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipScratchBuf, workspaceBuf, workspaceBytes);
     // Convert FP16 to FP32 for final output
-    size_t ownershipElts = batchSize * ownershipChannels * nnXLen * nnYLen;
     aclTensor* srcTensor = createAclTensor(ownershipScratchBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
     aclTensor* dstTensor = createAclTensor(ownershipBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
 
     uint64_t castWsSize = 0;
     aclOpExecutor* castExecutor = nullptr;
-    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, dstTensor, &castWsSize, &castExecutor);
+    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
     if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
       aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
     }
@@ -2089,12 +2111,12 @@ void Model::applyValueHead(
     vOwnershipConv->apply(stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipBuf, workspaceBuf, workspaceBytes);
   }
 
-  // Release intermediate buffers
-  scratch->release(ownershipScratchBuf);
-  scratch->release(v2OutBuf);
-  scratch->release(v1MeanBuf);
-  scratch->release(v1Out2Buf);
-  scratch->release(v1OutBuf);
+  // Free intermediate buffers
+  ascendFree(ownershipScratchBuf);
+  ascendFree(v2OutBuf);
+  ascendFree(v1MeanBuf);
+  ascendFree(v1Out2Buf);
+  ascendFree(v1OutBuf);
 
   (void)dtype;
 }
@@ -2285,7 +2307,7 @@ void NeuralNet::getOutput(
 
       uint64_t castWsSize = 0;
       aclOpExecutor* castExecutor = nullptr;
-      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, dstTensor, &castWsSize, &castExecutor);
+      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT16, dstTensor, &castWsSize, &castExecutor);
       if(status == ACLNN_SUCCESS) {
         status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
       }
@@ -2305,7 +2327,7 @@ void NeuralNet::getOutput(
 
       uint64_t castWsSize = 0;
       aclOpExecutor* castExecutor = nullptr;
-      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, dstTensor, &castWsSize, &castExecutor);
+      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT16, dstTensor, &castWsSize, &castExecutor);
       if(status == ACLNN_SUCCESS) {
         status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
       }
@@ -2325,7 +2347,7 @@ void NeuralNet::getOutput(
 
       uint64_t castWsSize = 0;
       aclOpExecutor* castExecutor = nullptr;
-      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, dstTensor, &castWsSize, &castExecutor);
+      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT16, dstTensor, &castWsSize, &castExecutor);
       if(status == ACLNN_SUCCESS) {
         status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
       }
@@ -2340,7 +2362,6 @@ void NeuralNet::getOutput(
   // Run model inference
   gpuHandle->model->apply(
     gpuHandle->stream,
-    gpuHandle->scratch,
     batchSize,
     gpuHandle->requireExactNNLen,
     buffers->inputBuf,
