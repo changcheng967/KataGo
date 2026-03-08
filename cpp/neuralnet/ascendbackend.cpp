@@ -5,6 +5,7 @@
 #include "acl/acl.h"
 #include "aclnn/aclnn_base.h"
 // ACLNN operator headers (from aclnnop directory)
+// Note: inplace variants are declared in the same header as non-inplace
 #include "aclnn_convolution.h"
 #include "aclnn_relu.h"
 #include "aclnn_add.h"
@@ -13,10 +14,7 @@
 #include "aclnn_adaptive_avg_pool2d.h"
 #include "aclnn_cast.h"
 #include "aclnn_fill_scalar.h"
-#include "aclnn_inplace_fill_scalar.h"
 #include "aclnn_copy.h"
-#include "aclnn_inplace_mul.h"
-#include "aclnn_inplace_add.h"
 #include "aclnn_cat.h"
 #include "aclnn_batch_norm.h"
 #include "aclnn_mish.h"
