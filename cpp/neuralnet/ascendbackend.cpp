@@ -122,9 +122,6 @@ static aclScalar* createFloatScalar(float value) {
   return aclCreateScalar(&value, ACL_FLOAT);
 }
 
-static aclScalar* createAclScalarInt(int64_t value) {
-  return aclCreateScalar(&value, ACL_INT64);
-}
 
 // Helper to destroy an aclTensor
 static void destroyAclTensor(aclTensor* tensor) {
@@ -190,33 +187,6 @@ static void* ascendMallocAndCopy(const void* hostData, size_t size) {
   return devicePtr;
 }
 
-// Convert float host data to fp16 on device
-static void ascendCopyFloatToHalf(aclrtStream stream, void* dstHalf, const float* srcFloat, size_t numElts, void* workspace, size_t workspaceSize) {
-  // First copy float data to a temporary device buffer
-  // Then use aclnnCast to convert to half
-  // For simplicity, we'll copy float data directly first then cast
-
-  // Create tensor for float input
-  vector<int64_t> shape = {static_cast<int64_t>(numElts)};
-  aclTensor* floatTensor = createAclTensor(nullptr, shape, ACL_FLOAT, ACL_FORMAT_ND);
-  aclTensor* halfTensor = createAclTensor(nullptr, shape, ACL_FLOAT16, ACL_FORMAT_ND);
-
-  // Actually, for the conversion, we need to use the workspace-based approach
-  // This is a placeholder - in practice, we'd use a custom kernel or aclnnCast properly
-
-  // For now, use a simple memcpy - the actual FP16 conversion will be handled
-  // by separate conversion functions when needed
-
-  (void)stream;
-  (void)dstHalf;
-  (void)srcFloat;
-  (void)workspace;
-  (void)workspaceSize;
-  (void)floatTensor;
-  (void)halfTensor;
-
-  // TODO: Implement proper float->half conversion using ACLNN
-}
 
 //---------------------------------------------------------------------------------
 // LoadedModel - simple wrapper around ModelDesc
@@ -1507,8 +1477,6 @@ struct GlobalPoolingResidualBlock {
     // 1. Main branch: input -> preBN -> regularConv -> regularOutBuf
     // 2. Global pooling branch: input -> gpoolConv -> gpoolBN -> global pool -> concat -> matmul -> bias
 
-    aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
-
     // Step 1: Apply pre NormActConv (preBN + preActivation + regularConv)
     // input -> regularOutBuf
     preNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, regularOutBuf, workspaceBuf, workspaceBytes);
@@ -2020,6 +1988,7 @@ void Model::applyValueHead(
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
+  (void)scratchBuf;  // Not currently used, but kept for API compatibility
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   int v1Channels = v1Conv->outChannels;
   int v2Channels = v2Mul->outChannels;
@@ -2295,8 +2264,6 @@ void NeuralNet::getOutput(
     }
 
     // Convert float to FP16 on device using aclnnCast
-    size_t spatialElts = (size_t)batchSize * numSpatialFeatures * nnXLen * nnYLen;
-    size_t globalElts = (size_t)batchSize * numGlobalFeatures;
 
     // Convert spatial input
     {
