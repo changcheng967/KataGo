@@ -1470,31 +1470,58 @@ struct GlobalPoolingResidualBlock {
     const void* maskBuf,
     const float* maskSumBuf,
     void* inputBuf,
-    void* scratchBuf,
+    void* regularOutBuf,
     void* gpoolOutBuf,
+    void* gpoolConcatBuf,
+    void* gpoolBiasBuf,
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
-    // This is a complex operation with global pooling
-    // For now, simplified implementation
+    // This block has two branches:
+    // 1. Main branch: input -> preBN -> regularConv -> regularOutBuf
+    // 2. Global pooling branch: input -> gpoolConv -> gpoolBN -> global pool -> concat -> matmul -> bias
 
+    aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+
+    // Step 1: Apply pre NormActConv (preBN + preActivation + regularConv)
+    // input -> regularOutBuf
+    preNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, regularOutBuf, workspaceBuf, workspaceBytes);
+
+    // Step 2: Apply gpoolConv on input -> gpoolOutBuf
+    gpoolConv->apply(stream, batchSize, nnXLen, nnYLen, false, inputBuf, gpoolOutBuf, workspaceBuf, workspaceBytes);
+
+    // Step 3: Apply gpoolBN on gpoolOutBuf (in-place)
+    gpoolBN->apply(stream, batchSize, gpoolOutBuf, maskBuf, gpoolOutBuf, workspaceBuf, workspaceBytes);
+
+    // Step 4: Global pooling (mean, max, mean * sqrt(area))
+    // For now, we'll use a simplified global average pooling
+    // Full implementation would need:
+    // - aclnnAdaptiveAvgPool2d for mean pooling to (1,1)
+    // - Custom kernel for max pooling
+    // - Concatenation of mean, mean * sqrt(area) - 14, max
+
+    // TODO: Implement proper global pooling with aclnnAdaptiveAvgPool2d
+    // For now, use a placeholder that copies zeros
+    (void)gpoolConcatBuf;
     (void)maskSumBuf;
-    (void)gpoolOutBuf;
 
-    // Apply pre NormActConv: input -> scratch
-    preNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, scratchBuf, workspaceBuf, workspaceBytes);
+    // Step 5: Apply gpoolToBiasMul to get bias for regular branch
+    // gpoolConcatBuf (batch, gpoolChannels*3) -> gpoolBiasBuf (batch, numChannels)
+    gpoolToBiasMul->apply(stream, batchSize, gpoolConcatBuf, gpoolBiasBuf, workspaceBuf, workspaceBytes);
 
-    // TODO: Implement global pooling branch
-    // 1. Apply gpoolConv
-    // 2. Apply gpoolBN
-    // 3. Global average pooling
-    // 4. Apply gpoolToBiasMul
-    // 5. Add bias to scratch
+    // Step 6: Add gpoolBias to regularOutBuf (broadcast bias across spatial dims)
+    // TODO: Implement aclnnAdd with proper broadcasting
+    // This adds the global pooling bias to each spatial location
 
-    // Apply mid NormActConv: scratch -> scratch
-    midNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, scratchBuf, scratchBuf, workspaceBuf, workspaceBytes);
+    // Step 7: Apply mid NormActConv (midBN + midActivation + finalConv) with residual
+    // regularOutBuf -> inputBuf (output, with residual from original input)
+    midNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, regularOutBuf, inputBuf, workspaceBuf, workspaceBytes);
 
-    // TODO: Add residual connection
+    // Step 8: Add residual connection
+    // TODO: Implement residual add: inputBuf + scratchBuf -> inputBuf
+    // Note: The inputBuf should contain the original trunk features for residual
+
+    (void)workspaceBytes;
   }
 };
 
