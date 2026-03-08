@@ -1459,6 +1459,11 @@ struct GlobalPoolingResidualBlock {
 // Model Structure
 //---------------------------------------------------------------------------------
 
+// Forward declarations for head structures
+struct Trunk;
+struct PolicyHead;
+struct ValueHead;
+
 struct Model {
   int numInputChannels;
   int numInputGlobalChannels;
@@ -1468,31 +1473,50 @@ struct Model {
   int numScoreValueChannels;
   int numOwnershipChannels;
   int modelVersion;
+  int trunkNumChannels;
   int nnXLen;
   int nnYLen;
   bool useFP16;
 
-  // Layers will be added here in full implementation
+  // Trunk layers
+  unique_ptr<ConvLayer> initialConv;
+  unique_ptr<MatMulLayer> initialMatMul;
+  unique_ptr<BatchNormLayer> trunkTipBN;
+  vector<unique_ptr<ResidualBlock>> residualBlocks;
+  vector<unique_ptr<GlobalPoolingResidualBlock>> gpoolBlocks;
 
-  Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
-    : numInputChannels(desc.numInputChannels),
-      numInputGlobalChannels(desc.numInputGlobalChannels),
-      numInputMetaChannels(desc.numInputMetaChannels),
-      numPolicyChannels(desc.numPolicyChannels),
-      numValueChannels(desc.numValueChannels),
-      numScoreValueChannels(desc.numScoreValueChannels),
-      numOwnershipChannels(desc.numOwnershipChannels),
-      modelVersion(desc.modelVersion),
-      nnXLen(nnX),
-      nnYLen(nnY),
-      useFP16(fp16)
-  {
-    // TODO: Create all layers from model description
-  }
+  // Policy head layers
+  unique_ptr<ConvLayer> p1Conv;
+  unique_ptr<ConvLayer> g1Conv;
+  unique_ptr<BatchNormLayer> g1BN;
+  unique_ptr<MatMulLayer> gpoolToBiasMul;
+  unique_ptr<BatchNormLayer> p1BN;
+  unique_ptr<ConvLayer> p2Conv;
+  unique_ptr<MatMulLayer> gpoolToPassMul;
+  unique_ptr<MatBiasLayer> gpoolToPassBias;
+  unique_ptr<MatMulLayer> gpoolToPassMul2;
 
-  ~Model() {
-    // TODO: Clean up layers
-  }
+  // Value head layers
+  unique_ptr<ConvLayer> v1Conv;
+  unique_ptr<BatchNormLayer> v1BN;
+  unique_ptr<MatMulLayer> v2Mul;
+  unique_ptr<MatBiasLayer> v2Bias;
+  unique_ptr<MatMulLayer> v3Mul;
+  unique_ptr<MatBiasLayer> v3Bias;
+  unique_ptr<MatMulLayer> sv3Mul;
+  unique_ptr<MatBiasLayer> sv3Bias;
+  unique_ptr<ConvLayer> vOwnershipConv;
+
+  // SGF Metadata encoder (optional)
+  bool hasMetadataEncoder;
+  unique_ptr<MatMulLayer> metaMul1;
+  unique_ptr<MatBiasLayer> metaBias1;
+  unique_ptr<MatMulLayer> metaMul2;
+  unique_ptr<MatBiasLayer> metaBias2;
+  unique_ptr<MatMulLayer> metaMul3;
+
+  Model(const ModelDesc& desc, int nnX, int nnY, bool fp16);
+  ~Model() {}
 
   void apply(
     aclrtStream stream,
@@ -1509,31 +1533,291 @@ struct Model {
     void* ownershipBuf,
     void* workspaceBuf,
     size_t workspaceBytes
-  ) const {
-    // TODO: Implement full forward pass
+  ) const;
 
-    (void)stream;
-    (void)scratch;
-    (void)batchSize;
-    (void)requireExactNNLen;
-    (void)inputBuf;
-    (void)inputGlobalBuf;
-    (void)inputMetaBuf;
-    (void)policyPassBuf;
-    (void)policyBuf;
-    (void)valueBuf;
-    (void)scoreValueBuf;
-    (void)ownershipBuf;
-    (void)workspaceBuf;
-    (void)workspaceBytes;
-  }
+  size_t requiredWorkspaceBytes(int maxBatchSize) const;
 
-  size_t requiredWorkspaceBytes(int maxBatchSize) const {
-    // Return a conservative estimate for now
-    (void)maxBatchSize;
-    return 1024 * 1024 * 64; // 64 MB
-  }
+private:
+  void applyTrunk(
+    aclrtStream stream,
+    int batchSize,
+    void* inputBuf,
+    void* inputGlobalBuf,
+    void* inputMetaBuf,
+    void* trunkOutputBuf,
+    void* maskBuf,
+    void* scratchBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const;
+
+  void applyPolicyHead(
+    aclrtStream stream,
+    int batchSize,
+    const void* trunkOutputBuf,
+    const void* maskBuf,
+    float* policyPassBuf,
+    float* policyBuf,
+    void* scratchBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const;
+
+  void applyValueHead(
+    aclrtStream stream,
+    int batchSize,
+    const void* trunkOutputBuf,
+    const void* maskBuf,
+    float* valueBuf,
+    float* scoreValueBuf,
+    void* ownershipBuf,
+    void* scratchBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const;
 };
+
+Model::Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
+  : numInputChannels(desc.numInputChannels),
+    numInputGlobalChannels(desc.numInputGlobalChannels),
+    numInputMetaChannels(desc.numInputMetaChannels),
+    numPolicyChannels(desc.numPolicyChannels),
+    numValueChannels(desc.numValueChannels),
+    numScoreValueChannels(desc.numScoreValueChannels),
+    numOwnershipChannels(desc.numOwnershipChannels),
+    modelVersion(desc.modelVersion),
+    trunkNumChannels(desc.trunk.trunkNumChannels),
+    nnXLen(nnX),
+    nnYLen(nnY),
+    useFP16(fp16),
+    hasMetadataEncoder(desc.numInputMetaChannels > 0)
+{
+  // Create trunk layers
+  initialConv = make_unique<ConvLayer>(&desc.trunk.initialConv, fp16);
+  initialMatMul = make_unique<MatMulLayer>(&desc.trunk.initialMatMul, fp16);
+
+  // Create residual blocks
+  for(const auto& blockPair : desc.trunk.blocks) {
+    int blockKind = blockPair.first;
+    if(blockKind == ORDINARY_BLOCK_KIND) {
+      const ResidualBlockDesc* rdesc = static_cast<const ResidualBlockDesc*>(blockPair.second.get());
+      residualBlocks.push_back(make_unique<ResidualBlock>(rdesc, nnX, nnY, fp16));
+    } else if(blockKind == GLOBAL_POOLING_BLOCK_KIND) {
+      const GlobalPoolingResidualBlockDesc* gdesc = static_cast<const GlobalPoolingResidualBlockDesc*>(blockPair.second.get());
+      gpoolBlocks.push_back(make_unique<GlobalPoolingResidualBlock>(gdesc, nnX, nnY, fp16));
+    }
+  }
+
+  // Create trunk tip BN
+  trunkTipBN = make_unique<BatchNormLayer>(&desc.trunk.trunkTipBN, &desc.trunk.trunkTipActivation, nnX, nnY, fp16);
+
+  // Create policy head layers
+  p1Conv = make_unique<ConvLayer>(&desc.policyHead.p1Conv, fp16);
+  g1Conv = make_unique<ConvLayer>(&desc.policyHead.g1Conv, fp16);
+  g1BN = make_unique<BatchNormLayer>(&desc.policyHead.g1BN, &desc.policyHead.g1Activation, nnX, nnY, fp16);
+  gpoolToBiasMul = make_unique<MatMulLayer>(&desc.policyHead.gpoolToBiasMul, fp16);
+  p1BN = make_unique<BatchNormLayer>(&desc.policyHead.p1BN, &desc.policyHead.p1Activation, nnX, nnY, fp16);
+  p2Conv = make_unique<ConvLayer>(&desc.policyHead.p2Conv, fp16);
+  gpoolToPassMul = make_unique<MatMulLayer>(&desc.policyHead.gpoolToPassMul, fp16);
+  gpoolToPassBias = make_unique<MatBiasLayer>(&desc.policyHead.gpoolToPassBias, fp16);
+  gpoolToPassMul2 = make_unique<MatMulLayer>(&desc.policyHead.gpoolToPassMul2, fp16);
+
+  // Create value head layers
+  v1Conv = make_unique<ConvLayer>(&desc.valueHead.v1Conv, fp16);
+  v1BN = make_unique<BatchNormLayer>(&desc.valueHead.v1BN, &desc.valueHead.v1Activation, nnX, nnY, fp16);
+  v2Mul = make_unique<MatMulLayer>(&desc.valueHead.v2Mul, fp16);
+  v2Bias = make_unique<MatBiasLayer>(&desc.valueHead.v2Bias, fp16);
+  v3Mul = make_unique<MatMulLayer>(&desc.valueHead.v3Mul, fp16);
+  v3Bias = make_unique<MatBiasLayer>(&desc.valueHead.v3Bias, fp16);
+  sv3Mul = make_unique<MatMulLayer>(&desc.valueHead.sv3Mul, fp16);
+  sv3Bias = make_unique<MatBiasLayer>(&desc.valueHead.sv3Bias, fp16);
+  vOwnershipConv = make_unique<ConvLayer>(&desc.valueHead.vOwnershipConv, fp16);
+
+  // Create metadata encoder layers if present
+  if(hasMetadataEncoder && desc.trunk.sgfMetadataEncoder.metaEncoderVersion > 0) {
+    const auto& meta = desc.trunk.sgfMetadataEncoder;
+    metaMul1 = make_unique<MatMulLayer>(&meta.mul1, fp16);
+    metaBias1 = make_unique<MatBiasLayer>(&meta.bias1, fp16);
+    metaMul2 = make_unique<MatMulLayer>(&meta.mul2, fp16);
+    metaBias2 = make_unique<MatBiasLayer>(&meta.bias2, fp16);
+    metaMul3 = make_unique<MatMulLayer>(&meta.mul3, fp16);
+  }
+}
+
+size_t Model::requiredWorkspaceBytes(int maxBatchSize) const {
+  // Calculate maximum workspace needed across all operations
+  size_t maxBytes = 0;
+
+  // Initial conv workspace
+  maxBytes = max(maxBytes, initialConv->requiredWorkspaceBytes(maxBatchSize, nnXLen, nnYLen, nullptr));
+
+  // Residual blocks
+  for(const auto& block : residualBlocks) {
+    maxBytes = max(maxBytes, block->requiredWorkspaceBytes(maxBatchSize, nnXLen, nnYLen, nullptr));
+  }
+
+  // Policy head
+  maxBytes = max(maxBytes, p1Conv->requiredWorkspaceBytes(maxBatchSize, nnXLen, nnYLen, nullptr));
+  maxBytes = max(maxBytes, p2Conv->requiredWorkspaceBytes(maxBatchSize, nnXLen, nnYLen, nullptr));
+
+  // Value head
+  maxBytes = max(maxBytes, v1Conv->requiredWorkspaceBytes(maxBatchSize, nnXLen, nnYLen, nullptr));
+  maxBytes = max(maxBytes, vOwnershipConv->requiredWorkspaceBytes(maxBatchSize, nnXLen, nnYLen, nullptr));
+
+  // Add extra for intermediate tensors
+  maxBytes += maxBatchSize * trunkNumChannels * nnXLen * nnYLen * sizeof(float) * 4;
+
+  return maxBytes;
+}
+
+void Model::apply(
+  aclrtStream stream,
+  ScratchBuffers* scratch,
+  int batchSize,
+  bool requireExactNNLen,
+  void* inputBuf,
+  void* inputGlobalBuf,
+  void* inputMetaBuf,
+  float* policyPassBuf,
+  float* policyBuf,
+  float* valueBuf,
+  float* scoreValueBuf,
+  void* ownershipBuf,
+  void* workspaceBuf,
+  size_t workspaceBytes
+) const {
+  // Allocate intermediate buffers from scratch
+  void* trunkOutputBuf = scratch->allocator->allocate(scratch->getBufSizeXY(trunkNumChannels));
+  void* maskBuf = scratch->allocator->allocate(scratch->getBufSizeXY(1));
+  void* scratchBuf = scratch->allocator->allocate(scratch->getBufSizeXY(trunkNumChannels));
+
+  // Apply trunk
+  applyTrunk(stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+  // Apply policy head
+  applyPolicyHead(stream, batchSize, trunkOutputBuf, maskBuf, policyPassBuf, policyBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+  // Apply value head
+  applyValueHead(stream, batchSize, trunkOutputBuf, maskBuf, valueBuf, scoreValueBuf, ownershipBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+  // Release scratch buffers
+  scratch->allocator->release(scratchBuf);
+  scratch->allocator->release(maskBuf);
+  scratch->allocator->release(trunkOutputBuf);
+
+  (void)requireExactNNLen;
+}
+
+void Model::applyTrunk(
+  aclrtStream stream,
+  int batchSize,
+  void* inputBuf,
+  void* inputGlobalBuf,
+  void* inputMetaBuf,
+  void* trunkOutputBuf,
+  void* maskBuf,
+  void* scratchBuf,
+  void* workspaceBuf,
+  size_t workspaceBytes
+) const {
+  // Extract mask from input channel 0
+  // TODO: Implement mask extraction using aclnn indexing
+
+  // Apply initial convolution: input -> trunkOutput
+  initialConv->apply(stream, batchSize, nnXLen, nnYLen, false, inputBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
+
+  // TODO: Apply initial matmul with global features
+  // This adds the global features to the trunk output
+  (void)inputGlobalBuf;
+  (void)inputMetaBuf;
+
+  // Apply residual blocks
+  for(const auto& block : residualBlocks) {
+    block->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, trunkOutputBuf, scratchBuf, workspaceBuf, workspaceBytes);
+  }
+
+  // Apply global pooling residual blocks
+  // TODO: Implement with mask sum buffer
+
+  // Apply trunk tip BN
+  trunkTipBN->apply(stream, batchSize, trunkOutputBuf, maskBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
+
+  (void)scratchBuf;
+}
+
+void Model::applyPolicyHead(
+  aclrtStream stream,
+  int batchSize,
+  const void* trunkOutputBuf,
+  const void* maskBuf,
+  float* policyPassBuf,
+  float* policyBuf,
+  void* scratchBuf,
+  void* workspaceBuf,
+  size_t workspaceBytes
+) const {
+  // Apply p1 conv: trunk -> scratch
+  p1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), scratchBuf, workspaceBuf, workspaceBytes);
+
+  // Apply p1 BN
+  p1BN->apply(stream, batchSize, scratchBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+  // Apply p2 conv: scratch -> policy output
+  p2Conv->apply(stream, batchSize, nnXLen, nnYLen, false, scratchBuf, policyBuf, workspaceBuf, workspaceBytes);
+
+  // TODO: Implement gpool branch for policy pass
+  // g1Conv, g1BN | global pool | gpoolToBiasMul | gpoolToPassMul | gpoolToPassBias | gpoolToPassMul2
+
+  (void)maskBuf;
+  (void)policyPassBuf;
+  (void)g1Conv;
+  (void)g1BN;
+  (void)gpoolToBiasMul;
+  (void)gpoolToPassMul;
+  (void)gpoolToPassBias;
+  (void)gpoolToPassMul2;
+}
+
+void Model::applyValueHead(
+  aclrtStream stream,
+  int batchSize,
+  const void* trunkOutputBuf,
+  const void* maskBuf,
+  float* valueBuf,
+  float* scoreValueBuf,
+  void* ownershipBuf,
+  void* scratchBuf,
+  void* workspaceBuf,
+  size_t workspaceBytes
+) const {
+  // Apply v1 conv: trunk -> scratch
+  v1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), scratchBuf, workspaceBuf, workspaceBytes);
+
+  // Apply v1 BN
+  v1BN->apply(stream, batchSize, scratchBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+  // Global pooling for value head
+  // TODO: Implement global average pooling
+
+  // Apply matmul layers for value output
+  // v2Mul | v2Bias -> intermediate
+  // v3Mul | v3Bias -> valueBuf
+
+  // Apply matmul layers for score value output
+  // sv3Mul | sv3Bias -> scoreValueBuf
+
+  // Apply ownership conv: scratch -> ownership
+  vOwnershipConv->apply(stream, batchSize, nnXLen, nnYLen, false, scratchBuf, ownershipBuf, workspaceBuf, workspaceBytes);
+
+  (void)valueBuf;
+  (void)scoreValueBuf;
+  (void)v2Mul;
+  (void)v2Bias;
+  (void)v3Mul;
+  (void)v3Bias;
+  (void)sv3Mul;
+  (void)sv3Bias;
+}
 
 //---------------------------------------------------------------------------------
 // ComputeContext / ComputeHandle creation
