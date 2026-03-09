@@ -71,6 +71,11 @@ using namespace std;
     } \
   } while(0)
 
+// cubeMathType: 0=KEEP_DTYPE, 1=ALLOW_FP32_DOWN_PRECISION, 2=USE_FP16, 3=USE_HF32
+// Ascend 910ProA Cube Unit only supports FP16, so we must use 1 to allow
+// automatic FP32->FP16 downcast for computation.
+static const int8_t ASCEND_CUBE_MATH_TYPE = 1;  // ALLOW_FP32_DOWN_PRECISION
+
 //---------------------------------------------------------------------------------
 // AscendCL Helper Functions
 //---------------------------------------------------------------------------------
@@ -760,7 +765,7 @@ struct ConvLayer {
       outputPaddingArr,
       (int64_t)1,     // groups
       outputTensor,
-      (int8_t)0,      // cubeMathType = KEEP_DTYPE
+      ASCEND_CUBE_MATH_TYPE,      // cubeMathType
       &workspaceSize,
       &executor
     );
@@ -853,7 +858,7 @@ struct ConvLayer {
       outputPaddingArr,
       (int64_t)1,     // groups
       outputTensor,
-      (int8_t)0,      // cubeMathType = KEEP_DTYPE
+      ASCEND_CUBE_MATH_TYPE,      // cubeMathType
       &wsSize,
       &executor
     );
@@ -1143,7 +1148,7 @@ struct MatMulLayer {
       inputTensor,
       weightTensor,
       outputTensor,
-      (int8_t)0,       // cubeMathType = KEEP_DTYPE
+      ASCEND_CUBE_MATH_TYPE,       // cubeMathType
       &wsSize,
       &executor
     );
