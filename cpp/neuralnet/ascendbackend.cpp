@@ -794,6 +794,16 @@ struct ConvLayer {
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
+    // Debug logging
+    cout << "Ascend ConvLayer::apply " << name
+         << " batch=" << batchSize << " inC=" << inChannels << " outC=" << outChannels
+         << " board=" << nnYLen << "x" << nnXLen
+         << " filter=" << convYSize << "x" << convXSize
+         << " dilation=" << dilationY << "x" << dilationX
+         << " dtype=" << (dtype == ACL_FLOAT16 ? "FP16" : "FP32")
+         << " accumulate=" << accumulate
+         << endl;
+
     // Create tensors
     vector<int64_t> inputShape = {batchSize, inChannels, nnYLen, nnXLen};
     vector<int64_t> outputShape = {batchSize, outChannels, nnYLen, nnXLen};
@@ -1793,6 +1803,13 @@ void Model::applyTrunk(
   size_t workspaceBytes
 ) const {
   // Apply initial convolution: input -> trunkOutput
+  cout << "Ascend: initialConv apply batchSize=" << batchSize
+       << " nnXLen=" << nnXLen << " nnYLen=" << nnYLen
+       << " inC=" << initialConv->inChannels
+       << " outC=" << initialConv->outChannels
+       << " filterSize=" << initialConv->convYSize << "x" << initialConv->convXSize
+       << " useFP16=" << useFP16
+       << endl;
   initialConv->apply(stream, batchSize, nnXLen, nnYLen, false, inputBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
 
   // Apply initial matmul with global features
@@ -1885,6 +1902,11 @@ void Model::applyPolicyHead(
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
+  cout << "Ascend: applyPolicyHead batchSize=" << batchSize
+       << " p1Channels=" << p1Conv->outChannels
+       << " g1Channels=" << g1Conv->outChannels
+       << " useFP16=" << useFP16
+       << endl;
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   int p1Channels = p1Conv->outChannels;
   int g1Channels = g1Conv->outChannels;
@@ -1993,6 +2015,12 @@ void Model::applyValueHead(
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
+  cout << "Ascend: applyValueHead batchSize=" << batchSize
+       << " v1Channels=" << v1Conv->outChannels
+       << " v2Channels=" << v2Mul->outChannels
+       << " ownershipChannels=" << vOwnershipConv->outChannels
+       << " useFP16=" << useFP16
+       << endl;
   (void)scratchBuf;  // Not currently used, but kept for API compatibility
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   int v1Channels = v1Conv->outChannels;
@@ -2158,7 +2186,7 @@ ComputeHandle* NeuralNet::createComputeHandle(
   else if(context->useFP16Mode == enabled_t::False)
     useFP16 = false;
   else // auto
-    useFP16 = true; // Default to FP16 for Ascend NPU (performance sweet spot)
+    useFP16 = false; // Default to FP32 until FP16 weight conversion is implemented
 
   ComputeHandle* handle = new ComputeHandle(
     deviceIdx, useFP16, context->nnXLen, context->nnYLen, requireExactNNLen, inputsUseNHWC
@@ -2222,6 +2250,12 @@ void NeuralNet::getOutput(
   const int nnXLen = gpuHandle->nnXLen;
   const int nnYLen = gpuHandle->nnYLen;
   const int modelVersion = gpuHandle->model->modelVersion;
+
+  cout << "Ascend: getOutput batchSize=" << batchSize
+       << " nnXLen=" << nnXLen << " nnYLen=" << nnYLen
+       << " useFP16=" << gpuHandle->usingFP16
+       << " modelVersion=" << modelVersion
+       << endl;
 
   const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
   const int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(modelVersion);
