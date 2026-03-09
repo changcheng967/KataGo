@@ -28,9 +28,9 @@ jobs:
         path: |
           cpp/CMakeCache.txt
           cpp/CMakeFiles
-        key: ${{ runner.os }}-cmake-${{ hashFiles('**/CMakeLists.txt') }}
+        key: ${{ runner.os }}-cmake-${{ github.repository }}-${{ hashFiles('**/CMakeLists.txt') }}
         restore-keys: |
-          ${{ runner.os }}-cmake-
+          ${{ runner.os }}-cmake-${{ github.repository }}-
 
     - name: Configure CMake
       working-directory: cpp
@@ -75,9 +75,9 @@ jobs:
             cpp/build.ninja
             cpp/.ninja_deps
             cpp/.ninja_log
-          key: ${{ runner.os }}-cmake-${{ hashFiles('**/CMakeLists.txt') }}
+          key: ${{ runner.os }}-cmake-${{ github.repository }}-${{ hashFiles('**/CMakeLists.txt') }}
           restore-keys: |
-            ${{ runner.os }}-cmake-
+            ${{ runner.os }}-cmake-${{ github.repository }}-
       - name: Configure CMake
         working-directory: cpp
         run: |
@@ -115,9 +115,9 @@ jobs:
         path: |
           ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
           ${{ env.VCPKG_INSTALLATION_ROOT }}/packages
-        key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}-opencl
+        key: ${{ runner.os }}-vcpkg-${{ github.repository }}-${{ hashFiles('**/vcpkg.json') }}-opencl
         restore-keys: |
-          ${{ runner.os }}-vcpkg-
+          ${{ runner.os }}-vcpkg-${{ github.repository }}-
 
     - name: Install vcpkg dependencies
       run: |
