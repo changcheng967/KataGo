@@ -715,6 +715,12 @@ struct ConvLayer {
   bool useFP16;
   int8_t cubeMathType;          // 0=KEEP_DTYPE (native FP16), 1=ALLOW_FP32_DOWN_PRECISION
 
+  // Cached aclIntArray objects - created once in constructor, reused every apply()
+  aclIntArray* stridesArr;
+  aclIntArray* paddingsArr;
+  aclIntArray* dilationsArr;
+  aclIntArray* outputPaddingArr;
+
   ConvLayer() = delete;
   ConvLayer(const ConvLayer&) = delete;
   ConvLayer& operator=(const ConvLayer&) = delete;
@@ -727,7 +733,11 @@ struct ConvLayer {
       convXSize(desc->convXSize),
       dilationY(desc->dilationY),
       dilationX(desc->dilationX),
-      useFP16(useFP16_)
+      useFP16(useFP16_),
+      stridesArr(nullptr),
+      paddingsArr(nullptr),
+      dilationsArr(nullptr),
+      outputPaddingArr(nullptr)
   {
     // Allocate and copy weights to device with native FP16 conversion
     // KataGo weights are in (outC, inC, H, W) format which is NCHW-compatible
@@ -741,10 +751,25 @@ struct ConvLayer {
       dtype = ACL_FLOAT;
       cubeMathType = 1;  // ALLOW_FP32_DOWN_PRECISION - let CANN convert FP32->FP16
     }
+
+    // Pre-create cached aclIntArray objects for convolution parameters
+    // These are constant for this layer and reused every apply() call
+    int paddingY = (convYSize / 2) * dilationY;
+    int paddingX = (convXSize / 2) * dilationX;
+
+    stridesArr = createAclIntArray({1, 1});
+    paddingsArr = createAclIntArray({paddingY, paddingX});
+    dilationsArr = createAclIntArray({dilationY, dilationX});
+    outputPaddingArr = createAclIntArray({0, 0});
   }
 
   ~ConvLayer() {
     ascendFree(filterBuf);
+    // Destroy cached aclIntArray objects
+    if(stridesArr) aclDestroyIntArray(stridesArr);
+    if(paddingsArr) aclDestroyIntArray(paddingsArr);
+    if(dilationsArr) aclDestroyIntArray(dilationsArr);
+    if(outputPaddingArr) aclDestroyIntArray(outputPaddingArr);
   }
 
   size_t requiredWorkspaceBytes(int batchSize, int nnXLen, int nnYLen, aclrtStream stream) const {
@@ -759,16 +784,7 @@ struct ConvLayer {
     aclTensor* weightTensor = createAclTensor(nullptr, weightShape, dtype, ACL_FORMAT_NCHW);
     aclTensor* outputTensor = createAclTensor(nullptr, outputShape, dtype, ACL_FORMAT_NCHW);
 
-    // Compute padding
-    int paddingY = (convYSize / 2) * dilationY;
-    int paddingX = (convXSize / 2) * dilationX;
-
-    // Create arrays for convolution parameters
-    aclIntArray* stridesArr = createAclIntArray({1, 1});
-    aclIntArray* paddingsArr = createAclIntArray({paddingY, paddingX});
-    aclIntArray* dilationsArr = createAclIntArray({dilationY, dilationX});
-    aclIntArray* outputPaddingArr = createAclIntArray({0, 0});
-
+    // Use cached aclIntArray objects created in constructor
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
 
@@ -792,14 +808,10 @@ struct ConvLayer {
       &executor
     );
 
-    // Cleanup
+    // Cleanup tensors only (cached arrays are destroyed in destructor)
     destroyAclTensor(inputTensor);
     destroyAclTensor(weightTensor);
     destroyAclTensor(outputTensor);
-    aclDestroyIntArray(stridesArr);
-    aclDestroyIntArray(paddingsArr);
-    aclDestroyIntArray(dilationsArr);
-    aclDestroyIntArray(outputPaddingArr);
 
     if(status != ACLNN_SUCCESS) {
       // Return a conservative estimate
@@ -845,17 +857,8 @@ struct ConvLayer {
       outputTensor = createAclTensor(actualOutputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
     }
 
-    // Compute padding
-    int paddingY = (convYSize / 2) * dilationY;
-    int paddingX = (convXSize / 2) * dilationX;
-
-    // Create arrays for convolution parameters
-    aclIntArray* stridesArr = createAclIntArray({1, 1});
-    aclIntArray* paddingsArr = createAclIntArray({paddingY, paddingX});
-    aclIntArray* dilationsArr = createAclIntArray({dilationY, dilationX});
-    aclIntArray* outputPaddingArr = createAclIntArray({0, 0});
-
     // Phase 1: Get workspace size
+    // Note: Using cached aclIntArray objects created in constructor
     uint64_t wsSize = 0;
     aclOpExecutor* executor = nullptr;
 
@@ -879,24 +882,16 @@ struct ConvLayer {
       destroyAclTensor(inputTensor);
       destroyAclTensor(weightTensor);
       destroyAclTensor(outputTensor);
-      aclDestroyIntArray(stridesArr);
-      aclDestroyIntArray(paddingsArr);
-      aclDestroyIntArray(dilationsArr);
-      aclDestroyIntArray(outputPaddingArr);
       throw StringError("aclnnConvolutionGetWorkspaceSize failed for layer " + name + " with error: " + to_string(status));
     }
 
     // Phase 2: Execute
     status = aclnnConvolution(workspaceBuf, wsSize, executor, stream);
 
-    // Cleanup
+    // Cleanup tensors only (cached arrays are destroyed in destructor)
     destroyAclTensor(inputTensor);
     destroyAclTensor(weightTensor);
     destroyAclTensor(outputTensor);
-    aclDestroyIntArray(stridesArr);
-    aclDestroyIntArray(paddingsArr);
-    aclDestroyIntArray(dilationsArr);
-    aclDestroyIntArray(outputPaddingArr);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnConvolution failed for layer " + name + " with error: " + to_string(status));
