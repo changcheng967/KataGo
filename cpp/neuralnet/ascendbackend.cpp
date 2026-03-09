@@ -141,6 +141,7 @@ static aclIntArray* createAclIntArray(const vector<int64_t>& values) {
 
 // Allocate device memory
 static void* ascendMalloc(size_t size) {
+  if(size == 0) return nullptr;
   void* ptr = nullptr;
   aclError ret = aclrtMalloc(&ptr, size, ACL_MEM_MALLOC_HUGE_FIRST);
   if(ret != ACL_SUCCESS) {
@@ -158,6 +159,7 @@ static void ascendFree(void* ptr) {
 
 // Copy host to device
 static void ascendCopyH2D(void* dst, const void* src, size_t size) {
+  if(size == 0 || dst == nullptr || src == nullptr) return;
   aclError ret = aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_HOST_TO_DEVICE);
   if(ret != ACL_SUCCESS) {
     throw StringError("aclrtMemcpy H2D failed with error: " + to_string(ret));
@@ -166,6 +168,7 @@ static void ascendCopyH2D(void* dst, const void* src, size_t size) {
 
 // Copy device to host
 static void ascendCopyD2H(void* dst, const void* src, size_t size) {
+  if(size == 0 || dst == nullptr || src == nullptr) return;
   aclError ret = aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_DEVICE_TO_HOST);
   if(ret != ACL_SUCCESS) {
     throw StringError("aclrtMemcpy D2H failed with error: " + to_string(ret));
@@ -174,6 +177,7 @@ static void ascendCopyD2H(void* dst, const void* src, size_t size) {
 
 // Copy device to device
 static void ascendCopyD2D(void* dst, const void* src, size_t size) {
+  if(size == 0 || dst == nullptr || src == nullptr) return;
   aclError ret = aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_DEVICE_TO_DEVICE);
   if(ret != ACL_SUCCESS) {
     throw StringError("aclrtMemcpy D2D failed with error: " + to_string(ret));
@@ -182,6 +186,7 @@ static void ascendCopyD2D(void* dst, const void* src, size_t size) {
 
 // Allocate and copy host data to device
 static void* ascendMallocAndCopy(const void* hostData, size_t size) {
+  if(size == 0 || hostData == nullptr) return nullptr;
   void* devicePtr = ascendMalloc(size);
   ascendCopyH2D(devicePtr, hostData, size);
   return devicePtr;
@@ -2115,6 +2120,13 @@ ComputeContext* NeuralNet::createComputeContext(
   vector<int> actualGpuIdxs = gpuIdxs;
   if(actualGpuIdxs.size() <= 0 || (actualGpuIdxs.size() == 1 && actualGpuIdxs[0] == -1)) {
     actualGpuIdxs = {0};
+  }
+
+  // Set default device before any allocations (model weights, buffers, etc.)
+  int defaultDevice = actualGpuIdxs[0];
+  aclError ret = aclrtSetDevice(defaultDevice);
+  if(ret != ACL_SUCCESS) {
+    throw StringError("aclrtSetDevice failed in createComputeContext for device " + to_string(defaultDevice) + " with error: " + to_string(ret));
   }
 
   return new ComputeContext(nnXLen, nnYLen, useFP16Mode, useNHWCMode, actualGpuIdxs);
