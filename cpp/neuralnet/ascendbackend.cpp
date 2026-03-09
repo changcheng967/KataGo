@@ -984,29 +984,33 @@ struct ConvLayer {
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
-    // Create tensors using cached descriptors
+    // Create tensors using cached descriptors (or fresh if handle is null for test functions)
     vector<int64_t> inputShape = {batchSize, inChannels, nnYLen, nnXLen};
     vector<int64_t> outputShape = {batchSize, outChannels, nnYLen, nnXLen};
     vector<int64_t> weightShape = {outChannels, inChannels, convYSize, convXSize};
 
-    aclTensor* inputTensor = handle->tensorCache.get(inputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
-    aclTensor* weightTensor = handle->tensorCache.get(filterBuf, weightShape, dtype, ACL_FORMAT_NCHW);
+    // Track locally-created tensors for cleanup when handle is nullptr
+    vector<aclTensor*> localTensors;
 
-    // For accumulate mode, ACLNN convolution doesn't support beta parameter directly
-    // We need to handle this differently
+    aclTensor* inputTensor;
+    aclTensor* weightTensor;
     aclTensor* outputTensor;
-    void* actualOutputBuf = outputBuf;
 
-    if(accumulate) {
-      // For accumulate mode, we need to:
-      // 1. Compute convolution into a temp buffer
-      // 2. Add to output buffer
-      // For simplicity, we'll just not support accumulate for now
-      // and rely on the caller to handle it
-      outputTensor = handle->tensorCache.get(actualOutputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+    if(handle != nullptr) {
+      inputTensor = handle->tensorCache.get(inputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
+      weightTensor = handle->tensorCache.get(filterBuf, weightShape, dtype, ACL_FORMAT_NCHW);
+      outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
     } else {
-      outputTensor = handle->tensorCache.get(actualOutputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+      inputTensor = createAclTensor(inputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
+      weightTensor = createAclTensor(filterBuf, weightShape, dtype, ACL_FORMAT_NCHW);
+      outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+      localTensors.push_back(inputTensor);
+      localTensors.push_back(weightTensor);
+      localTensors.push_back(outputTensor);
     }
+
+    // Note: accumulate mode is not fully implemented yet
+    (void)accumulate;
 
     // Phase 1: Get workspace size
     // Note: Using cached aclIntArray objects created in constructor
@@ -1030,20 +1034,18 @@ struct ConvLayer {
     );
 
     if(status != ACLNN_SUCCESS) {
+      for(aclTensor* t : localTensors) destroyAclTensor(t);
       throw StringError("aclnnConvolutionGetWorkspaceSize failed for layer " + name + " with error: " + to_string(status));
     }
 
     // Phase 2: Execute
     status = aclnnConvolution(workspaceBuf, wsSize, executor, stream);
 
+    // Cleanup local tensors if handle was nullptr
+    for(aclTensor* t : localTensors) destroyAclTensor(t);
+
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnConvolution failed for layer " + name + " with error: " + to_string(status));
-    }
-
-    // Handle accumulate mode with separate add if needed
-    if(accumulate) {
-      // TODO: Implement accumulate using aclnnAdd
-      // For now, this is not used in the initial implementation
     }
 
     (void)workspaceBytes;
@@ -2630,7 +2632,7 @@ bool NeuralNet::testEvaluateConv(
   }
 
   // Apply convolution
-  convLayer->apply(stream, batchSize, nnXLen, nnYLen, false, deviceInput, deviceOutput, deviceWorkspace, workspaceBytes);
+  convLayer->apply(nullptr, stream, batchSize, nnXLen, nnYLen, false, deviceInput, deviceOutput, deviceWorkspace, workspaceBytes);
 
   // Synchronize
   ACL_CHECK(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
