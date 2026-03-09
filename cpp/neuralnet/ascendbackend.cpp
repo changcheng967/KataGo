@@ -2280,6 +2280,10 @@ ComputeHandle* NeuralNet::createComputeHandle(
 
   // Create scratch buffers
   size_t workspaceNeeded = model->requiredWorkspaceBytes(maxBatchSize);
+  // Ensure minimum workspace for multi-NPU stability - 256MB minimum
+  // This prevents resource exhaustion when many ops are queued simultaneously
+  size_t minWorkspace = 256 * 1024 * 1024;
+  workspaceNeeded = std::max(workspaceNeeded, minWorkspace);
   ScratchBuffers* scratch = new ScratchBuffers(maxBatchSize, context->nnXLen, context->nnYLen, useFP16, workspaceNeeded);
   handle->scratch = scratch;
 
@@ -2460,9 +2464,15 @@ void NeuralNet::getOutput(
   );
 
   // Synchronize before copying results back
+  // This is critical for multi-NPU stability - ensures all ops complete before D2H copies
   aclError ret = aclrtSynchronizeStream(gpuHandle->stream);
   if(ret != ACL_SUCCESS) {
-    throw StringError("aclrtSynchronizeStream failed with error: " + to_string(ret));
+    // Error 507015 typically indicates stream timeout or resource exhaustion
+    // Log detailed error for debugging multi-NPU issues
+    string errMsg = "aclrtSynchronizeStream failed on device " + to_string(gpuHandle->deviceIdx)
+      + " with error: " + to_string((int)ret)
+      + " (batchSize=" + to_string(batchSize) + ")";
+    throw StringError(errMsg);
   }
 
   // Copy results back to host
