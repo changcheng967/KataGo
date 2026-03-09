@@ -602,6 +602,22 @@ struct Buffers {
   void* workspaceBuf;
   size_t workspaceBytes;
 
+  // Pre-allocated intermediate buffers (eliminates per-eval malloc/free)
+  void* trunkBuf;           // Trunk output buffer
+  void* maskBuf;            // Mask buffer
+  void* scratchBuf;         // Scratch buffer for residual blocks
+  void* p1OutBuf;           // Policy head intermediate
+  void* g1OutBuf;           // Policy head gpool intermediate
+  void* g1Out2Buf;          // Policy head gpool intermediate 2
+  void* g1ConcatBuf;        // Policy head gpool concat
+  void* g1BiasBuf;          // Policy head bias
+  void* p1PassBuf;          // Policy pass intermediate
+  void* v1OutBuf;           // Value head intermediate
+  void* v1Out2Buf;          // Value head intermediate 2
+  void* v1MeanBuf;          // Value head mean buffer
+  void* v2OutBuf;           // Value head v2 output
+  void* ownershipScratchBuf; // Ownership scratch buffer
+
   // Size tracking
   size_t inputBufBytes;
   size_t inputGlobalBufBytes;
@@ -614,6 +630,9 @@ struct Buffers {
   size_t valueBufBytes;
   size_t scoreValueBufBytes;
   size_t ownershipBufBytes;
+  size_t trunkBufBytes;
+  size_t maskBufBytes;
+  size_t scratchBufBytes;
 
   Buffers(const ModelDesc& m, int maxBatchSize, int nnXLen, int nnYLen, bool useFP16, size_t extraWorkspace)
     : inputBuf(nullptr),
@@ -628,7 +647,21 @@ struct Buffers {
       scoreValueBuf(nullptr),
       ownershipBuf(nullptr),
       workspaceBuf(nullptr),
-      workspaceBytes(0)
+      workspaceBytes(0),
+      trunkBuf(nullptr),
+      maskBuf(nullptr),
+      scratchBuf(nullptr),
+      p1OutBuf(nullptr),
+      g1OutBuf(nullptr),
+      g1Out2Buf(nullptr),
+      g1ConcatBuf(nullptr),
+      g1BiasBuf(nullptr),
+      p1PassBuf(nullptr),
+      v1OutBuf(nullptr),
+      v1Out2Buf(nullptr),
+      v1MeanBuf(nullptr),
+      v2OutBuf(nullptr),
+      ownershipScratchBuf(nullptr)
   {
     size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
 
@@ -645,6 +678,11 @@ struct Buffers {
     valueBufBytes = (size_t)maxBatchSize * m.numValueChannels * sizeof(float);
     scoreValueBufBytes = (size_t)maxBatchSize * m.numScoreValueChannels * sizeof(float);
     ownershipBufBytes = (size_t)maxBatchSize * nnXLen * nnYLen * m.numOwnershipChannels * sizeof(float);
+
+    // Intermediate buffer sizes
+    trunkBufBytes = (size_t)m.trunk.trunkNumChannels * maxBatchSize * nnXLen * nnYLen * eltSize;
+    maskBufBytes = (size_t)1 * maxBatchSize * nnXLen * nnYLen * eltSize;
+    scratchBufBytes = trunkBufBytes;
 
     // Allocate input buffers
     inputBuf = ascendMalloc(inputBufBytes);
@@ -669,6 +707,31 @@ struct Buffers {
     scoreValueBuf = (float*)ascendMalloc(scoreValueBufBytes);
     ownershipBuf = ascendMalloc(ownershipBufBytes);
 
+    // Allocate intermediate buffers
+    trunkBuf = ascendMalloc(trunkBufBytes);
+    maskBuf = ascendMalloc(maskBufBytes);
+    scratchBuf = ascendMalloc(scratchBufBytes);
+
+    // Policy head intermediate buffers
+    int p1Channels = m.policyHead.p1Conv.outChannels;
+    int g1Channels = m.policyHead.g1Conv.outChannels;
+    p1OutBuf = ascendMalloc((size_t)p1Channels * maxBatchSize * nnXLen * nnYLen * eltSize);
+    g1OutBuf = ascendMalloc((size_t)g1Channels * maxBatchSize * nnXLen * nnYLen * eltSize);
+    g1Out2Buf = ascendMalloc((size_t)g1Channels * maxBatchSize * nnXLen * nnYLen * eltSize);
+    g1ConcatBuf = ascendMalloc((size_t)g1Channels * 3 * maxBatchSize * sizeof(float));
+    g1BiasBuf = ascendMalloc((size_t)p1Channels * maxBatchSize * sizeof(float));
+    p1PassBuf = ascendMalloc((size_t)p1Channels * maxBatchSize * sizeof(float));
+
+    // Value head intermediate buffers
+    int v1Channels = m.valueHead.v1Conv.outChannels;
+    int v2Channels = m.valueHead.v2Mul.outChannels;
+    int ownershipChannels = m.valueHead.vOwnershipConv.outChannels;
+    v1OutBuf = ascendMalloc((size_t)v1Channels * maxBatchSize * nnXLen * nnYLen * eltSize);
+    v1Out2Buf = ascendMalloc((size_t)v1Channels * maxBatchSize * nnXLen * nnYLen * eltSize);
+    v1MeanBuf = ascendMalloc((size_t)v1Channels * 3 * maxBatchSize * sizeof(float));
+    v2OutBuf = ascendMalloc((size_t)v2Channels * maxBatchSize * sizeof(float));
+    ownershipScratchBuf = ascendMalloc((size_t)ownershipChannels * maxBatchSize * nnXLen * nnYLen * eltSize);
+
     // Allocate workspace
     workspaceBytes = extraWorkspace;
     if(workspaceBytes > 0) {
@@ -689,6 +752,21 @@ struct Buffers {
     ascendFree(scoreValueBuf);
     ascendFree(ownershipBuf);
     ascendFree(workspaceBuf);
+    // Free intermediate buffers
+    ascendFree(trunkBuf);
+    ascendFree(maskBuf);
+    ascendFree(scratchBuf);
+    ascendFree(p1OutBuf);
+    ascendFree(g1OutBuf);
+    ascendFree(g1Out2Buf);
+    ascendFree(g1ConcatBuf);
+    ascendFree(g1BiasBuf);
+    ascendFree(p1PassBuf);
+    ascendFree(v1OutBuf);
+    ascendFree(v1Out2Buf);
+    ascendFree(v1MeanBuf);
+    ascendFree(v2OutBuf);
+    ascendFree(ownershipScratchBuf);
   }
 
   Buffers() = delete;
@@ -1682,8 +1760,7 @@ struct Model {
     float* valueBuf,
     float* scoreValueBuf,
     void* ownershipBuf,
-    void* workspaceBuf,
-    size_t workspaceBytes
+    Buffers* buffers
   ) const;
 
   size_t requiredWorkspaceBytes(int maxBatchSize) const;
@@ -1711,7 +1788,8 @@ private:
     float* policyBuf,
     void* scratchBuf,
     void* workspaceBuf,
-    size_t workspaceBytes
+    size_t workspaceBytes,
+    Buffers* buffers
   ) const;
 
   void applyValueHead(
@@ -1724,7 +1802,8 @@ private:
     void* ownershipBuf,
     void* scratchBuf,
     void* workspaceBuf,
-    size_t workspaceBytes
+    size_t workspaceBytes,
+    Buffers* buffers
   ) const;
 };
 
@@ -1833,32 +1912,23 @@ void Model::apply(
   float* valueBuf,
   float* scoreValueBuf,
   void* ownershipBuf,
-  void* workspaceBuf,
-  size_t workspaceBytes
+  Buffers* buffers
 ) const {
-  // Allocate intermediate buffers
-  size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
-  size_t trunkOutputBytes = (size_t)batchSize * trunkNumChannels * nnXLen * nnYLen * eltSize;
-  size_t maskBytes = (size_t)batchSize * 1 * nnXLen * nnYLen * eltSize;
-  size_t scratchBytes = trunkOutputBytes;
-
-  void* trunkOutputBuf = ascendMalloc(trunkOutputBytes);
-  void* maskBuf = ascendMalloc(maskBytes);
-  void* scratchBuf = ascendMalloc(scratchBytes);
+  // Use pre-allocated intermediate buffers from Buffers struct
+  void* trunkOutputBuf = buffers->trunkBuf;
+  void* maskBuf = buffers->maskBuf;
+  void* scratchBuf = buffers->scratchBuf;
+  void* workspaceBuf = buffers->workspaceBuf;
+  size_t workspaceBytes = buffers->workspaceBytes;
 
   // Apply trunk
   applyTrunk(stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
 
-  // Apply policy head
-  applyPolicyHead(stream, batchSize, trunkOutputBuf, maskBuf, policyPassBuf, policyBuf, scratchBuf, workspaceBuf, workspaceBytes);
+  // Apply policy head with pre-allocated buffers
+  applyPolicyHead(stream, batchSize, trunkOutputBuf, maskBuf, policyPassBuf, policyBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
 
-  // Apply value head
-  applyValueHead(stream, batchSize, trunkOutputBuf, maskBuf, valueBuf, scoreValueBuf, ownershipBuf, scratchBuf, workspaceBuf, workspaceBytes);
-
-  // Free intermediate buffers
-  ascendFree(scratchBuf);
-  ascendFree(maskBuf);
-  ascendFree(trunkOutputBuf);
+  // Apply value head with pre-allocated buffers
+  applyValueHead(stream, batchSize, trunkOutputBuf, maskBuf, valueBuf, scoreValueBuf, ownershipBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
 
   (void)requireExactNNLen;
 }
@@ -1966,26 +2036,21 @@ void Model::applyPolicyHead(
   float* policyBuf,
   void* scratchBuf,
   void* workspaceBuf,
-  size_t workspaceBytes
+  size_t workspaceBytes,
+  Buffers* buffers
 ) const {
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   int p1Channels = p1Conv->outChannels;
   int g1Channels = g1Conv->outChannels;
-  size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
+  (void)g1Channels;  // Used for buffer sizing which is pre-allocated
 
-  // Allocate intermediate buffers
-  size_t p1OutBytes = (size_t)batchSize * p1Channels * nnXLen * nnYLen * eltSize;
-  size_t g1OutBytes = (size_t)batchSize * g1Channels * nnXLen * nnYLen * eltSize;
-  size_t g1ConcatBytes = (size_t)batchSize * g1Channels * 3 * sizeof(float);
-  size_t g1BiasBytes = (size_t)batchSize * p1Channels * sizeof(float);
-  size_t p1PassBytes = (size_t)batchSize * p1Channels * sizeof(float);
-
-  void* p1OutBuf = ascendMalloc(p1OutBytes);
-  void* g1OutBuf = ascendMalloc(g1OutBytes);
-  void* g1Out2Buf = ascendMalloc(g1OutBytes);
-  void* g1ConcatBuf = ascendMalloc(g1ConcatBytes);
-  void* g1BiasBuf = ascendMalloc(g1BiasBytes);
-  void* p1PassBuf = ascendMalloc(p1PassBytes);
+  // Use pre-allocated intermediate buffers from Buffers struct
+  void* p1OutBuf = buffers->p1OutBuf;
+  void* g1OutBuf = buffers->g1OutBuf;
+  void* g1Out2Buf = buffers->g1Out2Buf;
+  void* g1ConcatBuf = buffers->g1ConcatBuf;
+  void* g1BiasBuf = buffers->g1BiasBuf;
+  void* p1PassBuf = buffers->p1PassBuf;
 
   // Step 1: Apply p1Conv: trunk -> p1Out
   p1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
@@ -2012,7 +2077,7 @@ void Model::applyPolicyHead(
     vector<int64_t> biasShape = {batchSize, p1Channels, 1, 1};  // Broadcast to NCHW
 
     aclTensor* p1OutTensor = createAclTensor(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
-    aclTensor* biasTensor = createAclTensor(g1BiasBuf, biasShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* biasTensor = createAclTensor(g1BiasBuf, biasShape, ACL_FLOAT, ACL_FORMAT_NCHW);
     aclTensor* resultTensor = createAclTensor(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
     aclScalar* alpha = createFloatScalar(1.0f);
 
@@ -2029,8 +2094,6 @@ void Model::applyPolicyHead(
     aclDestroyScalar(alpha);
 
     if(status != ACLNN_SUCCESS) {
-      ascendFree(p1OutBuf); ascendFree(g1OutBuf); ascendFree(g1Out2Buf);
-      ascendFree(g1ConcatBuf); ascendFree(g1BiasBuf); ascendFree(p1PassBuf);
       throw StringError("aclnnAdd failed for policy head bias with error: " + to_string(status));
     }
   }
@@ -2053,14 +2116,7 @@ void Model::applyPolicyHead(
     gpoolToPassMul->apply(stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
   }
 
-  // Free intermediate buffers
-  ascendFree(p1PassBuf);
-  ascendFree(g1BiasBuf);
-  ascendFree(g1ConcatBuf);
-  ascendFree(g1Out2Buf);
-  ascendFree(g1OutBuf);
-  ascendFree(p1OutBuf);
-
+  // No ascendFree calls - all buffers are pre-allocated in Buffers struct
   (void)dtype;
 }
 
@@ -2074,26 +2130,20 @@ void Model::applyValueHead(
   void* ownershipBuf,
   void* scratchBuf,
   void* workspaceBuf,
-  size_t workspaceBytes
+  size_t workspaceBytes,
+  Buffers* buffers
 ) const {
   (void)scratchBuf;  // Not currently used, but kept for API compatibility
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   int v1Channels = v1Conv->outChannels;
-  int v2Channels = v2Mul->outChannels;
   int ownershipChannels = vOwnershipConv->outChannels;
-  size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
 
-  // Allocate intermediate buffers
-  size_t v1OutBytes = (size_t)batchSize * v1Channels * nnXLen * nnYLen * eltSize;
-  size_t v1MeanBytes = (size_t)batchSize * v1Channels * 3 * sizeof(float);  // mean, max, sqrt-area
-  size_t v2OutBytes = (size_t)batchSize * v2Channels * sizeof(float);
-  size_t ownershipScratchBytes = (size_t)batchSize * ownershipChannels * nnXLen * nnYLen * eltSize;
-
-  void* v1OutBuf = ascendMalloc(v1OutBytes);
-  void* v1Out2Buf = ascendMalloc(v1OutBytes);
-  void* v1MeanBuf = ascendMalloc(v1MeanBytes);
-  void* v2OutBuf = ascendMalloc(v2OutBytes);
-  void* ownershipScratchBuf = ascendMalloc(ownershipScratchBytes);
+  // Use pre-allocated intermediate buffers from Buffers struct
+  void* v1OutBuf = buffers->v1OutBuf;
+  void* v1Out2Buf = buffers->v1Out2Buf;
+  void* v1MeanBuf = buffers->v1MeanBuf;
+  void* v2OutBuf = buffers->v2OutBuf;
+  void* ownershipScratchBuf = buffers->ownershipScratchBuf;
 
   // Step 1: Apply v1Conv: trunk -> v1Out
   v1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), v1OutBuf, workspaceBuf, workspaceBytes);
@@ -2124,8 +2174,6 @@ void Model::applyValueHead(
     aclDestroyScalar(zeroScalar);
 
     if(status != ACLNN_SUCCESS) {
-      ascendFree(v1OutBuf); ascendFree(v1Out2Buf); ascendFree(v1MeanBuf);
-      ascendFree(v2OutBuf); ascendFree(ownershipScratchBuf);
       throw StringError("aclnnInplaceFillScalar failed for v1MeanBuf with error: " + to_string(status));
     }
   }
@@ -2168,13 +2216,7 @@ void Model::applyValueHead(
     vOwnershipConv->apply(stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipBuf, workspaceBuf, workspaceBytes);
   }
 
-  // Free intermediate buffers
-  ascendFree(ownershipScratchBuf);
-  ascendFree(v2OutBuf);
-  ascendFree(v1MeanBuf);
-  ascendFree(v1Out2Buf);
-  ascendFree(v1OutBuf);
-
+  // No ascendFree calls - all buffers are pre-allocated in Buffers struct
   (void)dtype;
 }
 
@@ -2454,8 +2496,7 @@ void NeuralNet::getOutput(
     buffers->valueBuf,
     buffers->scoreValueBuf,
     buffers->ownershipBuf,
-    buffers->workspaceBuf,
-    buffers->workspaceBytes
+    buffers
   );
 
   // Synchronize before copying results back
