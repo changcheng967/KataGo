@@ -402,36 +402,6 @@ public:
 };
 
 //---------------------------------------------------------------------------------
-// Executor Cache for ACLNN operators
-// Caches aclOpExecutor* to skip GetWorkspaceSize on steady-state batches
-//---------------------------------------------------------------------------------
-
-struct ExecutorCacheEntry {
-  aclOpExecutor* executor;
-  uint64_t workspaceSize;
-};
-
-// Key: {layer pointer, operation index within layer, batch size}
-struct ExecutorKey {
-  const void* layerPtr;  // Use 'this' pointer of the layer as unique ID
-  int opIndex;           // Sub-operation index within a layer (0, 1, 2...)
-  int batchSize;
-
-  bool operator==(const ExecutorKey& o) const {
-    return layerPtr == o.layerPtr && opIndex == o.opIndex && batchSize == o.batchSize;
-  }
-};
-
-struct ExecutorKeyHash {
-  size_t operator()(const ExecutorKey& k) const {
-    size_t h = std::hash<const void*>()(k.layerPtr);
-    h ^= std::hash<int>()(k.opIndex) << 16;
-    h ^= std::hash<int>()(k.batchSize) << 24;
-    return h;
-  }
-};
-
-//---------------------------------------------------------------------------------
 // ComputeHandle - per-thread handle
 //---------------------------------------------------------------------------------
 
@@ -455,9 +425,9 @@ struct ComputeHandle {
   // Cached alpha=1.0 scalar for Add operations
   aclScalar* alphaOneScalar;
 
-  // Executor cache - skip GetWorkspaceSize on steady-state batches
-  std::unordered_map<ExecutorKey, ExecutorCacheEntry, ExecutorKeyHash> executorCache;
-  int cachedBatchSize = -1;  // Track when to invalidate executor cache
+  // Ping-pong buffer management for residual blocks
+  // Instead of D2D copy, swap trunk/scratch pointers
+  bool trunkIsPrimary;  // true = trunk is primaryBuf, scratch is secondaryBuf
 
   ComputeHandle() = delete;
   ComputeHandle(const ComputeHandle&) = delete;
@@ -475,7 +445,7 @@ struct ComputeHandle {
       requireExactNNLen(exactLen),
       inputsUseNHWC(nhwc),
       alphaOneScalar(nullptr),
-      cachedBatchSize(-1)
+      trunkIsPrimary(true)
   {
   }
 
@@ -483,9 +453,6 @@ struct ComputeHandle {
     // Set device context first since destructor may run on a different thread
     // CANN's device binding is thread-local
     aclrtSetDevice(deviceIdx);
-
-    // Note: executors are owned by CANN runtime and don't need explicit destruction
-    executorCache.clear();
 
     if(alphaOneScalar != nullptr) {
       aclDestroyScalar(alphaOneScalar);
@@ -499,19 +466,6 @@ struct ComputeHandle {
   void initScalars() {
     if(alphaOneScalar == nullptr) {
       alphaOneScalar = createFloatScalar(1.0f);
-    }
-  }
-
-  void invalidateExecutorCache() {
-    executorCache.clear();
-    cachedBatchSize = -1;
-  }
-
-  // Check and invalidate cache if batch size changed
-  void checkBatchSizeChange(int batchSize) {
-    if(batchSize != cachedBatchSize) {
-      invalidateExecutorCache();
-      cachedBatchSize = batchSize;
     }
   }
 };
@@ -1084,54 +1038,33 @@ struct ConvLayer {
     // Note: accumulate mode is not fully implemented yet
     (void)accumulate;
 
+    // Phase 1: Get workspace size
     uint64_t wsSize = 0;
     aclOpExecutor* executor = nullptr;
-    bool useCached = false;
 
-    // Try to use cached executor if handle is available
-    if(handle != nullptr) {
-      ExecutorKey key{this, 0, batchSize};
-      auto it = handle->executorCache.find(key);
-      if(it != handle->executorCache.end()) {
-        // Cache hit - skip GetWorkspaceSize
-        wsSize = it->second.workspaceSize;
-        executor = it->second.executor;
-        useCached = true;
-      }
-    }
+    aclnnStatus status = aclnnConvolutionGetWorkspaceSize(
+      inputTensor,
+      weightTensor,
+      nullptr,        // bias
+      stridesArr,
+      paddingsArr,
+      dilationsArr,
+      false,          // transposed
+      outputPaddingArr,
+      (int64_t)1,     // groups
+      outputTensor,
+      cubeMathType,      // cubeMathType: 0 for native FP16, 1 for FP32->FP16 conversion
+      &wsSize,
+      &executor
+    );
 
-    if(!useCached) {
-      // Cache miss - do full two-phase
-      aclnnStatus status = aclnnConvolutionGetWorkspaceSize(
-        inputTensor,
-        weightTensor,
-        nullptr,        // bias
-        stridesArr,
-        paddingsArr,
-        dilationsArr,
-        false,          // transposed
-        outputPaddingArr,
-        (int64_t)1,     // groups
-        outputTensor,
-        cubeMathType,      // cubeMathType: 0 for native FP16, 1 for FP32->FP16 conversion
-        &wsSize,
-        &executor
-      );
-
-      if(status != ACLNN_SUCCESS) {
-        for(aclTensor* t : localTensors) destroyAclTensor(t);
-        throw StringError("aclnnConvolutionGetWorkspaceSize failed for layer " + name + " with error: " + to_string(status));
-      }
-
-      // Cache the executor
-      if(handle != nullptr) {
-        ExecutorKey key{this, 0, batchSize};
-        handle->executorCache[key] = {executor, wsSize};
-      }
+    if(status != ACLNN_SUCCESS) {
+      for(aclTensor* t : localTensors) destroyAclTensor(t);
+      throw StringError("aclnnConvolutionGetWorkspaceSize failed for layer " + name + " with error: " + to_string(status));
     }
 
     // Phase 2: Execute
-    aclnnStatus status = aclnnConvolution(workspaceBuf, wsSize, executor, stream);
+    status = aclnnConvolution(workspaceBuf, wsSize, executor, stream);
 
     // Cleanup local tensors if handle was nullptr
     for(aclTensor* t : localTensors) destroyAclTensor(t);
@@ -1212,31 +1145,19 @@ struct BatchNormLayer {
 
       uint64_t mulWsSize = 0;
       aclOpExecutor* mulExecutor = nullptr;
-      bool useCached = false;
 
-      ExecutorKey key{this, 0, batchSize};
-      auto it = handle->executorCache.find(key);
-      if(it != handle->executorCache.end()) {
-        mulWsSize = it->second.workspaceSize;
-        mulExecutor = it->second.executor;
-        useCached = true;
+      aclnnStatus status = aclnnMulGetWorkspaceSize(inputTensor, scaleTensor, outputTensor, &mulWsSize, &mulExecutor);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnMulGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
-      if(!useCached) {
-        aclnnStatus status = aclnnMulGetWorkspaceSize(inputTensor, scaleTensor, outputTensor, &mulWsSize, &mulExecutor);
-        if(status != ACLNN_SUCCESS) {
-          throw StringError("aclnnMulGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
-        }
-        handle->executorCache[key] = {mulExecutor, mulWsSize};
-      }
-
-      aclnnStatus status = aclnnMul(workspaceBuf, mulWsSize, mulExecutor, stream);
+      status = aclnnMul(workspaceBuf, mulWsSize, mulExecutor, stream);
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnMul failed for BatchNorm " + name + " with error: " + to_string(status));
       }
     }
 
-    // Step 2: Add bias (opIndex 1)
+    // Step 2: Add bias
     {
       vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
       vector<int64_t> biasShape = {1, numChannels, 1, 1};  // Broadcast to NCHW
@@ -1246,31 +1167,19 @@ struct BatchNormLayer {
 
       uint64_t addWsSize = 0;
       aclOpExecutor* addExecutor = nullptr;
-      bool useCached = false;
 
-      ExecutorKey key{this, 1, batchSize};
-      auto it = handle->executorCache.find(key);
-      if(it != handle->executorCache.end()) {
-        addWsSize = it->second.workspaceSize;
-        addExecutor = it->second.executor;
-        useCached = true;
+      aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, biasTensor, handle->alphaOneScalar, outputTensor, &addWsSize, &addExecutor);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnAddGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
-      if(!useCached) {
-        aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, biasTensor, handle->alphaOneScalar, outputTensor, &addWsSize, &addExecutor);
-        if(status != ACLNN_SUCCESS) {
-          throw StringError("aclnnAddGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
-        }
-        handle->executorCache[key] = {addExecutor, addWsSize};
-      }
-
-      aclnnStatus status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+      status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnAdd failed for BatchNorm " + name + " with error: " + to_string(status));
       }
     }
 
-    // Step 3: Apply activation (opIndex 2 for activation, opIndex 3 for scale8)
+    // Step 3: Apply activation
     if(activation == ACTIVATION_RELU) {
       vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
 
@@ -1278,25 +1187,13 @@ struct BatchNormLayer {
 
       uint64_t reluWsSize = 0;
       aclOpExecutor* reluExecutor = nullptr;
-      bool useCached = false;
 
-      ExecutorKey key{this, 2, batchSize};
-      auto it = handle->executorCache.find(key);
-      if(it != handle->executorCache.end()) {
-        reluWsSize = it->second.workspaceSize;
-        reluExecutor = it->second.executor;
-        useCached = true;
+      aclnnStatus status = aclnnInplaceReluGetWorkspaceSize(outputTensor, &reluWsSize, &reluExecutor);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnInplaceReluGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
-      if(!useCached) {
-        aclnnStatus status = aclnnInplaceReluGetWorkspaceSize(outputTensor, &reluWsSize, &reluExecutor);
-        if(status != ACLNN_SUCCESS) {
-          throw StringError("aclnnInplaceReluGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
-        }
-        handle->executorCache[key] = {reluExecutor, reluWsSize};
-      }
-
-      aclnnStatus status = aclnnInplaceRelu(workspaceBuf, reluWsSize, reluExecutor, stream);
+      status = aclnnInplaceRelu(workspaceBuf, reluWsSize, reluExecutor, stream);
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnInplaceRelu failed for BatchNorm " + name + " with error: " + to_string(status));
       }
@@ -1309,54 +1206,28 @@ struct BatchNormLayer {
 
       uint64_t mishWsSize = 0;
       aclOpExecutor* mishExecutor = nullptr;
-      bool useCached = false;
 
-      ExecutorKey key{this, 2, batchSize};
-      auto it = handle->executorCache.find(key);
-      if(it != handle->executorCache.end()) {
-        mishWsSize = it->second.workspaceSize;
-        mishExecutor = it->second.executor;
-        useCached = true;
+      aclnnStatus status = aclnnInplaceMishGetWorkspaceSize(outputTensor, &mishWsSize, &mishExecutor);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnInplaceMishGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
-      if(!useCached) {
-        aclnnStatus status = aclnnInplaceMishGetWorkspaceSize(outputTensor, &mishWsSize, &mishExecutor);
-        if(status != ACLNN_SUCCESS) {
-          throw StringError("aclnnInplaceMishGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
-        }
-        handle->executorCache[key] = {mishExecutor, mishWsSize};
-      }
-
-      aclnnStatus status = aclnnInplaceMish(workspaceBuf, mishWsSize, mishExecutor, stream);
+      status = aclnnInplaceMish(workspaceBuf, mishWsSize, mishExecutor, stream);
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnInplaceMish failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
       // For ACTIVATION_MISH_SCALE8, scale the output by 8.0
-      // mish_scale8(x) = 8.0 * mish(x)
       if(activation == ACTIVATION_MISH_SCALE8) {
-        aclTensor* scaledTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
         aclScalar* scaleScalar = createFloatScalar(8.0f);
 
         uint64_t mulWsSize = 0;
         aclOpExecutor* mulExecutor = nullptr;
-        bool useCachedScale = false;
 
-        ExecutorKey keyScale{this, 3, batchSize};
-        auto itScale = handle->executorCache.find(keyScale);
-        if(itScale != handle->executorCache.end()) {
-          mulWsSize = itScale->second.workspaceSize;
-          mulExecutor = itScale->second.executor;
-          useCachedScale = true;
-        }
-
-        if(!useCachedScale) {
-          status = aclnnInplaceMulsGetWorkspaceSize(scaledTensor, scaleScalar, &mulWsSize, &mulExecutor);
-          if(status != ACLNN_SUCCESS) {
-            aclDestroyScalar(scaleScalar);
-            throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 " + name + " with error: " + to_string(status));
-          }
-          handle->executorCache[keyScale] = {mulExecutor, mulWsSize};
+        status = aclnnInplaceMulsGetWorkspaceSize(outputTensor, scaleScalar, &mulWsSize, &mulExecutor);
+        if(status != ACLNN_SUCCESS) {
+          aclDestroyScalar(scaleScalar);
+          throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 " + name + " with error: " + to_string(status));
         }
 
         status = aclnnInplaceMuls(workspaceBuf, mulWsSize, mulExecutor, stream);
@@ -1367,38 +1238,23 @@ struct BatchNormLayer {
       }
     }
 
-    // Step 4: Apply mask if provided (opIndex 4)
-    // The mask zeros out the padded regions
+    // Step 4: Apply mask if provided
     if(maskBuf != nullptr) {
-      // output = output * mask (elementwise)
-      // mask is (N, H, W) shaped, need to broadcast
       vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
-      vector<int64_t> maskShape = {batchSize, 1, nnYLen, nnXLen};  // N, 1, H, W for broadcasting
+      vector<int64_t> maskShape = {batchSize, 1, nnYLen, nnXLen};
 
       aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
       aclTensor* maskTensor = handle->tensorCache.get(const_cast<void*>(maskBuf), maskShape, dtype, ACL_FORMAT_NCHW);
 
       uint64_t maskWsSize = 0;
       aclOpExecutor* maskExecutor = nullptr;
-      bool useCached = false;
 
-      ExecutorKey key{this, 4, batchSize};
-      auto it = handle->executorCache.find(key);
-      if(it != handle->executorCache.end()) {
-        maskWsSize = it->second.workspaceSize;
-        maskExecutor = it->second.executor;
-        useCached = true;
+      aclnnStatus status = aclnnInplaceMulGetWorkspaceSize(outputTensor, maskTensor, &maskWsSize, &maskExecutor);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnInplaceMulGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
-      if(!useCached) {
-        aclnnStatus status = aclnnInplaceMulGetWorkspaceSize(outputTensor, maskTensor, &maskWsSize, &maskExecutor);
-        if(status != ACLNN_SUCCESS) {
-          throw StringError("aclnnInplaceMulGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
-        }
-        handle->executorCache[key] = {maskExecutor, maskWsSize};
-      }
-
-      aclnnStatus status = aclnnInplaceMul(workspaceBuf, maskWsSize, maskExecutor, stream);
+      status = aclnnInplaceMul(workspaceBuf, maskWsSize, maskExecutor, stream);
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnInplaceMul failed for BatchNorm " + name + " with error: " + to_string(status));
       }
@@ -1472,34 +1328,21 @@ struct MatMulLayer {
     vector<int64_t> outputShape = {batchSize, outChannels};
     aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
 
-    // Phase 1: Get workspace size (with executor caching)
+    // Phase 1: Get workspace size
     uint64_t wsSize = 0;
     aclOpExecutor* executor = nullptr;
-    bool useCached = false;
 
-    ExecutorKey key{this, 0, batchSize};
-    auto it = handle->executorCache.find(key);
-    if(it != handle->executorCache.end()) {
-      wsSize = it->second.workspaceSize;
-      executor = it->second.executor;
-      useCached = true;
-    }
+    aclnnStatus status = aclnnMatmulGetWorkspaceSize(
+      inputTensor,
+      weightTensor,
+      outputTensor,
+      cubeMathType,       // cubeMathType: 0 for native FP16, 1 for FP32->FP16 conversion
+      &wsSize,
+      &executor
+    );
 
-    if(!useCached) {
-      aclnnStatus status = aclnnMatmulGetWorkspaceSize(
-        inputTensor,
-        weightTensor,
-        outputTensor,
-        cubeMathType,       // cubeMathType: 0 for native FP16, 1 for FP32->FP16 conversion
-        &wsSize,
-        &executor
-      );
-
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnMatmulGetWorkspaceSize failed for MatMul " + name + " with error: " + to_string(status));
-      }
-
-      handle->executorCache[key] = {executor, wsSize};
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnMatmulGetWorkspaceSize failed for MatMul " + name + " with error: " + to_string(status));
     }
 
     // Verify workspace is sufficient
@@ -1508,7 +1351,7 @@ struct MatMulLayer {
     }
 
     // Phase 2: Execute
-    aclnnStatus status = aclnnMatmul(workspaceBuf, wsSize, executor, stream);
+    status = aclnnMatmul(workspaceBuf, wsSize, executor, stream);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnMatmul failed for MatMul " + name + " with error: " + to_string(status));
@@ -1573,25 +1416,13 @@ struct MatBiasLayer {
     vector<int64_t> outputShape = {batchSize, numChannels};
     aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
 
-    // Phase 1: Get workspace size (with executor caching)
+    // Phase 1: Get workspace size
     uint64_t wsSize = 0;
     aclOpExecutor* executor = nullptr;
-    bool useCached = false;
 
-    ExecutorKey key{this, 0, batchSize};
-    auto it = handle->executorCache.find(key);
-    if(it != handle->executorCache.end()) {
-      wsSize = it->second.workspaceSize;
-      executor = it->second.executor;
-      useCached = true;
-    }
-
-    if(!useCached) {
-      aclnnStatus status = aclnnAddGetWorkspaceSize(inputTensor, biasTensor, handle->alphaOneScalar, outputTensor, &wsSize, &executor);
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnAddGetWorkspaceSize failed for MatBias " + name + " with error: " + to_string(status));
-      }
-      handle->executorCache[key] = {executor, wsSize};
+    aclnnStatus status = aclnnAddGetWorkspaceSize(inputTensor, biasTensor, handle->alphaOneScalar, outputTensor, &wsSize, &executor);
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnAddGetWorkspaceSize failed for MatBias " + name + " with error: " + to_string(status));
     }
 
     // Verify workspace is sufficient
@@ -1600,7 +1431,7 @@ struct MatBiasLayer {
     }
 
     // Phase 2: Execute
-    aclnnStatus status = aclnnAdd(workspaceBuf, wsSize, executor, stream);
+    status = aclnnAdd(workspaceBuf, wsSize, executor, stream);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for MatBias " + name + " with error: " + to_string(status));
@@ -1730,29 +1561,17 @@ struct ResidualBlock {
     // Create output tensor for the result (same as outputTensor since in-place)
     aclTensor* resultTensor = handle->tensorCache.get(outputBuf, addShape, dtype, ACL_FORMAT_NCHW);
 
-    // Phase 1: Get workspace size for add (with executor caching)
+    // Phase 1: Get workspace size for add
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
-    bool useCached = false;
 
-    ExecutorKey key{this, 0, batchSize};
-    auto it = handle->executorCache.find(key);
-    if(it != handle->executorCache.end()) {
-      addWsSize = it->second.workspaceSize;
-      addExecutor = it->second.executor;
-      useCached = true;
-    }
-
-    if(!useCached) {
-      aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, residualTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnAddGetWorkspaceSize failed for ResidualBlock " + name + " with error: " + to_string(status));
-      }
-      handle->executorCache[key] = {addExecutor, addWsSize};
+    aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, residualTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnAddGetWorkspaceSize failed for ResidualBlock " + name + " with error: " + to_string(status));
     }
 
     // Phase 2: Execute add
-    aclnnStatus status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+    status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for ResidualBlock " + name + " with error: " + to_string(status));
