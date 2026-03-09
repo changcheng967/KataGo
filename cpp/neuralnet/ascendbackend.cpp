@@ -1033,10 +1033,55 @@ struct BatchNormLayer {
 
       destroyAclTensor(outputTensor);
     }
-    // Note: MISH activation is not directly supported - would need custom implementation
-    // For now, if MISH is requested, throw an error
+    // MISH activation using native ACLNN operator
     else if(activation == ACTIVATION_MISH || activation == ACTIVATION_MISH_SCALE8) {
-      throw StringError("MISH activation not yet supported in Ascend backend for layer " + name);
+      vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
+
+      aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+
+      uint64_t mishWsSize = 0;
+      aclOpExecutor* mishExecutor = nullptr;
+
+      aclnnStatus status = aclnnInplaceMishGetWorkspaceSize(outputTensor, &mishWsSize, &mishExecutor);
+      if(status != ACLNN_SUCCESS) {
+        destroyAclTensor(outputTensor);
+        throw StringError("aclnnInplaceMishGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
+      }
+
+      status = aclnnInplaceMish(workspaceBuf, mishWsSize, mishExecutor, stream);
+      if(status != ACLNN_SUCCESS) {
+        destroyAclTensor(outputTensor);
+        throw StringError("aclnnInplaceMish failed for BatchNorm " + name + " with error: " + to_string(status));
+      }
+
+      destroyAclTensor(outputTensor);
+
+      // For ACTIVATION_MISH_SCALE8, scale the output by 8.0
+      // mish_scale8(x) = 8.0 * mish(x)
+      if(activation == ACTIVATION_MISH_SCALE8) {
+        aclTensor* scaledTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+        aclScalar* scaleScalar = createFloatScalar(8.0f);
+
+        uint64_t mulWsSize = 0;
+        aclOpExecutor* mulExecutor = nullptr;
+
+        status = aclnnInplaceMulsGetWorkspaceSize(scaledTensor, scaleScalar, &mulWsSize, &mulExecutor);
+        if(status != ACLNN_SUCCESS) {
+          destroyAclTensor(scaledTensor);
+          aclDestroyScalar(scaleScalar);
+          throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 " + name + " with error: " + to_string(status));
+        }
+
+        status = aclnnInplaceMuls(workspaceBuf, mulWsSize, mulExecutor, stream);
+        if(status != ACLNN_SUCCESS) {
+          destroyAclTensor(scaledTensor);
+          aclDestroyScalar(scaleScalar);
+          throw StringError("aclnnInplaceMuls failed for MISH_SCALE8 " + name + " with error: " + to_string(status));
+        }
+
+        destroyAclTensor(scaledTensor);
+        aclDestroyScalar(scaleScalar);
+      }
     }
 
     // Step 4: Apply mask if provided
