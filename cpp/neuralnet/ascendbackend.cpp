@@ -362,6 +362,9 @@ struct ComputeHandle {
   {}
 
   ~ComputeHandle() {
+    // Set device context first since destructor may run on a different thread
+    // CANN's device binding is thread-local
+    aclrtSetDevice(deviceIdx);
     if(stream != nullptr) {
       aclrtDestroyStream(stream);
     }
@@ -2231,7 +2234,6 @@ ComputeHandle* NeuralNet::createComputeHandle(
   int gpuIdxForThisThread,
   int serverThreadIdx
 ) {
-  (void)logger;
   (void)serverThreadIdx;
 
   int deviceIdx = (gpuIdxForThisThread == -1) ? 0 : gpuIdxForThisThread;
@@ -2262,6 +2264,15 @@ ComputeHandle* NeuralNet::createComputeHandle(
     throw StringError("aclrtCreateStream failed with error: " + to_string(ret));
   }
 
+  // Log device assignment for multi-NPU debugging
+  if(logger != nullptr) {
+    logger->write(
+      "Ascend NPU backend thread " + Global::intToString(serverThreadIdx)
+      + ": using device " + Global::intToString(deviceIdx)
+      + ", FP16 " + string(useFP16 ? "enabled" : "disabled")
+    );
+  }
+
   // Create model
   const ModelDesc& modelDesc = loadedModel->modelDesc;
   Model* model = new Model(modelDesc, context->nnXLen, context->nnYLen, useFP16);
@@ -2280,10 +2291,14 @@ ComputeHandle* NeuralNet::createComputeHandle(
 }
 
 void NeuralNet::freeComputeHandle(ComputeHandle* computeHandle) {
-  delete computeHandle->buffers;
-  delete computeHandle->scratch;
-  delete computeHandle->model;
-  delete computeHandle;
+  if(computeHandle != nullptr) {
+    // Set device context before freeing resources on the correct device
+    aclrtSetDevice(computeHandle->deviceIdx);
+    delete computeHandle->buffers;
+    delete computeHandle->scratch;
+    delete computeHandle->model;
+    delete computeHandle;
+  }
 }
 
 bool NeuralNet::isUsingFP16(const ComputeHandle* computeHandle) {
@@ -2301,6 +2316,10 @@ void NeuralNet::getOutput(
   NNResultBuf** inputBufs,
   vector<NNOutput*>& outputs
 ) {
+  // Set device context - critical for multi-NPU since each server thread
+  // needs to be bound to its device for all ACL/ACLNN calls
+  aclrtSetDevice(gpuHandle->deviceIdx);
+
   assert(numBatchEltsFilled <= inputBuffers->maxBatchSize);
   assert(numBatchEltsFilled > 0);
   const int batchSize = numBatchEltsFilled;
