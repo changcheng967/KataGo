@@ -2358,10 +2358,6 @@ void NeuralNet::getOutput(
 
   assert(numBatchEltsFilled <= inputBuffers->maxBatchSize);
   const int batchSize = numBatchEltsFilled;
-
-  // Invalidate executor cache if batch size changed
-  gpuHandle->checkBatchSizeChange(batchSize);
-
   const int nnXLen = gpuHandle->nnXLen;
   const int nnYLen = gpuHandle->nnYLen;
   const int modelVersion = gpuHandle->model->modelVersion;
