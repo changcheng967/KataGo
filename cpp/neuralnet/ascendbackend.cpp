@@ -327,6 +327,62 @@ struct ComputeContext {
 };
 
 //---------------------------------------------------------------------------------
+// TensorCache - caches aclTensor descriptors per ComputeHandle
+//---------------------------------------------------------------------------------
+
+struct TensorCacheKey {
+  void* data;
+  int64_t dims[4];  // shape padded with 0s for unused dims
+  int ndim;
+  aclDataType dtype;
+  aclFormat format;
+
+  bool operator==(const TensorCacheKey& o) const {
+    return data == o.data && ndim == o.ndim && dtype == o.dtype
+      && format == o.format && memcmp(dims, o.dims, sizeof(dims)) == 0;
+  }
+};
+
+struct TensorCacheKeyHash {
+  size_t operator()(const TensorCacheKey& k) const {
+    size_t h = std::hash<void*>()(k.data);
+    for(int i = 0; i < k.ndim; i++)
+      h ^= std::hash<int64_t>()(k.dims[i]) << (i + 1);
+    h ^= std::hash<int>()(k.dtype) << 5;
+    return h;
+  }
+};
+
+class TensorCache {
+  std::unordered_map<TensorCacheKey, aclTensor*, TensorCacheKeyHash> cache;
+public:
+  aclTensor* get(void* data, const vector<int64_t>& shape,
+                  aclDataType dtype, aclFormat format) {
+    TensorCacheKey key;
+    key.data = data;
+    memset(key.dims, 0, sizeof(key.dims));
+    key.ndim = (int)shape.size();
+    for(int i = 0; i < key.ndim && i < 4; i++)
+      key.dims[i] = shape[i];
+    key.dtype = dtype;
+    key.format = format;
+
+    auto it = cache.find(key);
+    if(it != cache.end()) return it->second;
+
+    aclTensor* t = createAclTensor(data, shape, dtype, format);
+    cache[key] = t;
+    return t;
+  }
+
+  ~TensorCache() {
+    for(auto& p : cache) {
+      destroyAclTensor(p.second);
+    }
+  }
+};
+
+//---------------------------------------------------------------------------------
 // ComputeHandle - per-thread handle
 //---------------------------------------------------------------------------------
 
@@ -344,6 +400,12 @@ struct ComputeHandle {
   bool requireExactNNLen;
   bool inputsUseNHWC;
 
+  // Cached tensor descriptors - eliminates per-eval create/destroy overhead
+  TensorCache tensorCache;
+
+  // Cached alpha=1.0 scalar for Add operations
+  aclScalar* alphaOneScalar;
+
   ComputeHandle() = delete;
   ComputeHandle(const ComputeHandle&) = delete;
   ComputeHandle& operator=(const ComputeHandle&) = delete;
@@ -358,17 +420,27 @@ struct ComputeHandle {
       nnXLen(nnX),
       nnYLen(nnY),
       requireExactNNLen(exactLen),
-      inputsUseNHWC(nhwc)
+      inputsUseNHWC(nhwc),
+      alphaOneScalar(nullptr)
   {}
 
   ~ComputeHandle() {
     // Set device context first since destructor may run on a different thread
     // CANN's device binding is thread-local
     aclrtSetDevice(deviceIdx);
+    if(alphaOneScalar != nullptr) {
+      aclDestroyScalar(alphaOneScalar);
+    }
     if(stream != nullptr) {
       aclrtDestroyStream(stream);
     }
     aclrtResetDevice(deviceIdx);
+  }
+
+  void initScalars() {
+    if(alphaOneScalar == nullptr) {
+      alphaOneScalar = createFloatScalar(1.0f);
+    }
   }
 };
 
@@ -901,6 +973,7 @@ struct ConvLayer {
   }
 
   void apply(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     int nnXLen,
@@ -911,13 +984,13 @@ struct ConvLayer {
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
-    // Create tensors
+    // Create tensors using cached descriptors
     vector<int64_t> inputShape = {batchSize, inChannels, nnYLen, nnXLen};
     vector<int64_t> outputShape = {batchSize, outChannels, nnYLen, nnXLen};
     vector<int64_t> weightShape = {outChannels, inChannels, convYSize, convXSize};
 
-    aclTensor* inputTensor = createAclTensor(inputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
-    aclTensor* weightTensor = createAclTensor(filterBuf, weightShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* inputTensor = handle->tensorCache.get(inputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* weightTensor = handle->tensorCache.get(filterBuf, weightShape, dtype, ACL_FORMAT_NCHW);
 
     // For accumulate mode, ACLNN convolution doesn't support beta parameter directly
     // We need to handle this differently
@@ -930,9 +1003,9 @@ struct ConvLayer {
       // 2. Add to output buffer
       // For simplicity, we'll just not support accumulate for now
       // and rely on the caller to handle it
-      outputTensor = createAclTensor(actualOutputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+      outputTensor = handle->tensorCache.get(actualOutputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
     } else {
-      outputTensor = createAclTensor(actualOutputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+      outputTensor = handle->tensorCache.get(actualOutputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
     }
 
     // Phase 1: Get workspace size
@@ -957,19 +1030,11 @@ struct ConvLayer {
     );
 
     if(status != ACLNN_SUCCESS) {
-      destroyAclTensor(inputTensor);
-      destroyAclTensor(weightTensor);
-      destroyAclTensor(outputTensor);
       throw StringError("aclnnConvolutionGetWorkspaceSize failed for layer " + name + " with error: " + to_string(status));
     }
 
     // Phase 2: Execute
     status = aclnnConvolution(workspaceBuf, wsSize, executor, stream);
-
-    // Cleanup tensors only (cached arrays are destroyed in destructor)
-    destroyAclTensor(inputTensor);
-    destroyAclTensor(weightTensor);
-    destroyAclTensor(outputTensor);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnConvolution failed for layer " + name + " with error: " + to_string(status));
@@ -1027,6 +1092,7 @@ struct BatchNormLayer {
   }
 
   void apply(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     void* inputBuf,
@@ -1046,9 +1112,9 @@ struct BatchNormLayer {
       vector<int64_t> inputShape = {batchSize, numChannels, nnYLen, nnXLen};
       vector<int64_t> scaleShape = {1, numChannels, 1, 1};  // Broadcast to NCHW
 
-      aclTensor* inputTensor = createAclTensor(inputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
-      aclTensor* scaleTensor = createAclTensor(mergedScaleBuf, scaleShape, dtype, ACL_FORMAT_NCHW);
-      aclTensor* outputTensor = createAclTensor(outputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* inputTensor = handle->tensorCache.get(inputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* scaleTensor = handle->tensorCache.get(mergedScaleBuf, scaleShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* outputTensor = handle->tensorCache.get(outputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
 
       // Two-phase pattern for mul
       uint64_t mulWsSize = 0;
@@ -1056,23 +1122,13 @@ struct BatchNormLayer {
 
       aclnnStatus status = aclnnMulGetWorkspaceSize(inputTensor, scaleTensor, outputTensor, &mulWsSize, &mulExecutor);
       if(status != ACLNN_SUCCESS) {
-        destroyAclTensor(inputTensor);
-        destroyAclTensor(scaleTensor);
-        destroyAclTensor(outputTensor);
         throw StringError("aclnnMulGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
       status = aclnnMul(workspaceBuf, mulWsSize, mulExecutor, stream);
       if(status != ACLNN_SUCCESS) {
-        destroyAclTensor(inputTensor);
-        destroyAclTensor(scaleTensor);
-        destroyAclTensor(outputTensor);
         throw StringError("aclnnMul failed for BatchNorm " + name + " with error: " + to_string(status));
       }
-
-      destroyAclTensor(inputTensor);
-      destroyAclTensor(scaleTensor);
-      destroyAclTensor(outputTensor);
     }
 
     // Step 2: Add bias
@@ -1080,84 +1136,65 @@ struct BatchNormLayer {
       vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
       vector<int64_t> biasShape = {1, numChannels, 1, 1};  // Broadcast to NCHW
 
-      aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
-      aclTensor* biasTensor = createAclTensor(mergedBiasBuf, biasShape, dtype, ACL_FORMAT_NCHW);
-      aclScalar* alpha = createFloatScalar(1.0f);
+      aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* biasTensor = handle->tensorCache.get(mergedBiasBuf, biasShape, dtype, ACL_FORMAT_NCHW);
 
       uint64_t addWsSize = 0;
       aclOpExecutor* addExecutor = nullptr;
 
-      aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, biasTensor, alpha, outputTensor, &addWsSize, &addExecutor);
+      aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, biasTensor, handle->alphaOneScalar, outputTensor, &addWsSize, &addExecutor);
       if(status != ACLNN_SUCCESS) {
-        destroyAclTensor(outputTensor);
-        destroyAclTensor(biasTensor);
-        aclDestroyScalar(alpha);
         throw StringError("aclnnAddGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
       status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
       if(status != ACLNN_SUCCESS) {
-        destroyAclTensor(outputTensor);
-        destroyAclTensor(biasTensor);
-        aclDestroyScalar(alpha);
         throw StringError("aclnnAdd failed for BatchNorm " + name + " with error: " + to_string(status));
       }
-
-      destroyAclTensor(outputTensor);
-      destroyAclTensor(biasTensor);
-      aclDestroyScalar(alpha);
     }
 
     // Step 3: Apply activation (relu if needed)
     if(activation == ACTIVATION_RELU) {
       vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
 
-      aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
 
       uint64_t reluWsSize = 0;
       aclOpExecutor* reluExecutor = nullptr;
 
       aclnnStatus status = aclnnInplaceReluGetWorkspaceSize(outputTensor, &reluWsSize, &reluExecutor);
       if(status != ACLNN_SUCCESS) {
-        destroyAclTensor(outputTensor);
         throw StringError("aclnnInplaceReluGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
       status = aclnnInplaceRelu(workspaceBuf, reluWsSize, reluExecutor, stream);
       if(status != ACLNN_SUCCESS) {
-        destroyAclTensor(outputTensor);
         throw StringError("aclnnInplaceRelu failed for BatchNorm " + name + " with error: " + to_string(status));
       }
-
-      destroyAclTensor(outputTensor);
     }
     // MISH activation using native ACLNN operator
     else if(activation == ACTIVATION_MISH || activation == ACTIVATION_MISH_SCALE8) {
       vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
 
-      aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
 
       uint64_t mishWsSize = 0;
       aclOpExecutor* mishExecutor = nullptr;
 
       aclnnStatus status = aclnnInplaceMishGetWorkspaceSize(outputTensor, &mishWsSize, &mishExecutor);
       if(status != ACLNN_SUCCESS) {
-        destroyAclTensor(outputTensor);
         throw StringError("aclnnInplaceMishGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
       status = aclnnInplaceMish(workspaceBuf, mishWsSize, mishExecutor, stream);
       if(status != ACLNN_SUCCESS) {
-        destroyAclTensor(outputTensor);
         throw StringError("aclnnInplaceMish failed for BatchNorm " + name + " with error: " + to_string(status));
       }
-
-      destroyAclTensor(outputTensor);
 
       // For ACTIVATION_MISH_SCALE8, scale the output by 8.0
       // mish_scale8(x) = 8.0 * mish(x)
       if(activation == ACTIVATION_MISH_SCALE8) {
-        aclTensor* scaledTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+        aclTensor* scaledTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
         aclScalar* scaleScalar = createFloatScalar(8.0f);
 
         uint64_t mulWsSize = 0;
@@ -1165,20 +1202,15 @@ struct BatchNormLayer {
 
         status = aclnnInplaceMulsGetWorkspaceSize(scaledTensor, scaleScalar, &mulWsSize, &mulExecutor);
         if(status != ACLNN_SUCCESS) {
-          destroyAclTensor(scaledTensor);
           aclDestroyScalar(scaleScalar);
           throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 " + name + " with error: " + to_string(status));
         }
 
         status = aclnnInplaceMuls(workspaceBuf, mulWsSize, mulExecutor, stream);
+        aclDestroyScalar(scaleScalar);
         if(status != ACLNN_SUCCESS) {
-          destroyAclTensor(scaledTensor);
-          aclDestroyScalar(scaleScalar);
           throw StringError("aclnnInplaceMuls failed for MISH_SCALE8 " + name + " with error: " + to_string(status));
         }
-
-        destroyAclTensor(scaledTensor);
-        aclDestroyScalar(scaleScalar);
       }
     }
 
@@ -1190,28 +1222,21 @@ struct BatchNormLayer {
       vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
       vector<int64_t> maskShape = {batchSize, 1, nnYLen, nnXLen};  // N, 1, H, W for broadcasting
 
-      aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
-      aclTensor* maskTensor = createAclTensor(const_cast<void*>(maskBuf), maskShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* maskTensor = handle->tensorCache.get(const_cast<void*>(maskBuf), maskShape, dtype, ACL_FORMAT_NCHW);
 
       uint64_t maskWsSize = 0;
       aclOpExecutor* maskExecutor = nullptr;
 
       aclnnStatus status = aclnnInplaceMulGetWorkspaceSize(outputTensor, maskTensor, &maskWsSize, &maskExecutor);
       if(status != ACLNN_SUCCESS) {
-        destroyAclTensor(outputTensor);
-        destroyAclTensor(maskTensor);
         throw StringError("aclnnInplaceMulGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
 
       status = aclnnInplaceMul(workspaceBuf, maskWsSize, maskExecutor, stream);
       if(status != ACLNN_SUCCESS) {
-        destroyAclTensor(outputTensor);
-        destroyAclTensor(maskTensor);
         throw StringError("aclnnInplaceMul failed for BatchNorm " + name + " with error: " + to_string(status));
       }
-
-      destroyAclTensor(outputTensor);
-      destroyAclTensor(maskTensor);
     }
 
     (void)workspaceBytes;
@@ -1255,6 +1280,7 @@ struct MatMulLayer {
   }
 
   void apply(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     void* inputBuf,
@@ -1271,15 +1297,15 @@ struct MatMulLayer {
 
     // Create input tensor: (N, inC)
     vector<int64_t> inputShape = {batchSize, inChannels};
-    aclTensor* inputTensor = createAclTensor(inputBuf, inputShape, dtype, ACL_FORMAT_ND);
+    aclTensor* inputTensor = handle->tensorCache.get(inputBuf, inputShape, dtype, ACL_FORMAT_ND);
 
     // Create weight tensor: (inC, outC)
     vector<int64_t> weightShape = {inChannels, outChannels};
-    aclTensor* weightTensor = createAclTensor(matBuf, weightShape, dtype, ACL_FORMAT_ND);
+    aclTensor* weightTensor = handle->tensorCache.get(matBuf, weightShape, dtype, ACL_FORMAT_ND);
 
     // Create output tensor: (N, outC)
     vector<int64_t> outputShape = {batchSize, outChannels};
-    aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
+    aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
 
     // Phase 1: Get workspace size
     uint64_t wsSize = 0;
@@ -1295,33 +1321,20 @@ struct MatMulLayer {
     );
 
     if(status != ACLNN_SUCCESS) {
-      destroyAclTensor(inputTensor);
-      destroyAclTensor(weightTensor);
-      destroyAclTensor(outputTensor);
       throw StringError("aclnnMatmulGetWorkspaceSize failed for MatMul " + name + " with error: " + to_string(status));
     }
 
     // Verify workspace is sufficient
     if(wsSize > workspaceBytes) {
-      destroyAclTensor(inputTensor);
-      destroyAclTensor(weightTensor);
-      destroyAclTensor(outputTensor);
       throw StringError("MatMul " + name + " requires more workspace: " + to_string(wsSize) + " > " + to_string(workspaceBytes));
     }
 
     // Phase 2: Execute
     status = aclnnMatmul(workspaceBuf, wsSize, executor, stream);
 
-    // Cleanup
-    destroyAclTensor(inputTensor);
-    destroyAclTensor(weightTensor);
-    destroyAclTensor(outputTensor);
-
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnMatmul failed for MatMul " + name + " with error: " + to_string(status));
     }
-
-    (void)workspaceBytes;
   }
 };
 
@@ -1356,6 +1369,7 @@ struct MatBiasLayer {
   }
 
   void apply(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     void* inputBuf,
@@ -1371,56 +1385,37 @@ struct MatBiasLayer {
 
     // Create input tensor: (N, C)
     vector<int64_t> inputShape = {batchSize, numChannels};
-    aclTensor* inputTensor = createAclTensor(inputBuf, inputShape, dtype, ACL_FORMAT_ND);
+    aclTensor* inputTensor = handle->tensorCache.get(inputBuf, inputShape, dtype, ACL_FORMAT_ND);
 
     // Create bias tensor: (1, C) - will broadcast across batch
     vector<int64_t> biasShape = {1, numChannels};
-    aclTensor* biasTensor = createAclTensor(biasBuf, biasShape, dtype, ACL_FORMAT_ND);
+    aclTensor* biasTensor = handle->tensorCache.get(biasBuf, biasShape, dtype, ACL_FORMAT_ND);
 
     // Create output tensor: (N, C)
     vector<int64_t> outputShape = {batchSize, numChannels};
-    aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
-
-    // Create scalar for alpha (out = self + alpha * other)
-    aclScalar* alpha = createFloatScalar(1.0f);
+    aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
 
     // Phase 1: Get workspace size
     uint64_t wsSize = 0;
     aclOpExecutor* executor = nullptr;
 
-    aclnnStatus status = aclnnAddGetWorkspaceSize(inputTensor, biasTensor, alpha, outputTensor, &wsSize, &executor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(inputTensor, biasTensor, handle->alphaOneScalar, outputTensor, &wsSize, &executor);
 
     if(status != ACLNN_SUCCESS) {
-      destroyAclTensor(inputTensor);
-      destroyAclTensor(biasTensor);
-      destroyAclTensor(outputTensor);
-      aclDestroyScalar(alpha);
       throw StringError("aclnnAddGetWorkspaceSize failed for MatBias " + name + " with error: " + to_string(status));
     }
 
     // Verify workspace is sufficient
     if(wsSize > workspaceBytes) {
-      destroyAclTensor(inputTensor);
-      destroyAclTensor(biasTensor);
-      destroyAclTensor(outputTensor);
-      aclDestroyScalar(alpha);
       throw StringError("MatBias " + name + " requires more workspace: " + to_string(wsSize) + " > " + to_string(workspaceBytes));
     }
 
     // Phase 2: Execute
     status = aclnnAdd(workspaceBuf, wsSize, executor, stream);
 
-    // Cleanup
-    destroyAclTensor(inputTensor);
-    destroyAclTensor(biasTensor);
-    destroyAclTensor(outputTensor);
-    aclDestroyScalar(alpha);
-
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for MatBias " + name + " with error: " + to_string(status));
     }
-
-    (void)workspaceBytes;
   }
 };
 
@@ -1457,6 +1452,7 @@ struct NormActConv {
   }
 
   void apply(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     int nnXLen,
@@ -1468,10 +1464,10 @@ struct NormActConv {
     size_t workspaceBytes
   ) const {
     // Apply BN + activation in-place on input
-    bnLayer->apply(stream, batchSize, inputBuf, maskBuf, inputBuf, workspaceBuf, workspaceBytes);
+    bnLayer->apply(handle, stream, batchSize, inputBuf, maskBuf, inputBuf, workspaceBuf, workspaceBytes);
 
     // Then apply convolution
-    convLayer->apply(stream, batchSize, nnXLen, nnYLen, false, inputBuf, outputBuf, workspaceBuf, workspaceBytes);
+    convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, inputBuf, outputBuf, workspaceBuf, workspaceBytes);
   }
 };
 
@@ -1509,6 +1505,7 @@ struct ResidualBlock {
   }
 
   void apply(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     int nnXLen,
@@ -1527,55 +1524,39 @@ struct ResidualBlock {
 
     // Apply pre NormActConv: input -> input (in-place for BN part, then conv to output)
     // But we need a separate buffer, so: input -> output
-    preNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, outputBuf, workspaceBuf, workspaceBytes);
+    preNormActConv->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, outputBuf, workspaceBuf, workspaceBytes);
 
     // Apply mid NormActConv: output -> output (in-place BN then conv)
-    midNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, outputBuf, outputBuf, workspaceBuf, workspaceBytes);
+    midNormActConv->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf, outputBuf, outputBuf, workspaceBuf, workspaceBytes);
 
     // Add residual: output + scratch -> output
     // This is the key step - add the saved residual to the transformed output
     aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
 
-    // Create tensors for addition
+    // Create tensors for addition using cache
     vector<int64_t> addShape = {batchSize, numChannels, nnYLen, nnXLen};
-    aclTensor* outputTensor = createAclTensor(outputBuf, addShape, dtype, ACL_FORMAT_NCHW);
-    aclTensor* residualTensor = createAclTensor(scratchBuf, addShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* outputTensor = handle->tensorCache.get(outputBuf, addShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* residualTensor = handle->tensorCache.get(scratchBuf, addShape, dtype, ACL_FORMAT_NCHW);
 
-    // Create output tensor for the result
-    vector<int64_t> resultShape = {batchSize, numChannels, nnYLen, nnXLen};
-    aclTensor* resultTensor = createAclTensor(outputBuf, resultShape, dtype, ACL_FORMAT_NCHW);
-
-    // Create scalar for alpha
-    aclScalar* alpha = createFloatScalar(1.0f);
+    // Create output tensor for the result (same as outputTensor since in-place)
+    aclTensor* resultTensor = handle->tensorCache.get(outputBuf, addShape, dtype, ACL_FORMAT_NCHW);
 
     // Phase 1: Get workspace size for add
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
 
-    aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, residualTensor, alpha, resultTensor, &addWsSize, &addExecutor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, residualTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
 
     if(status != ACLNN_SUCCESS) {
-      destroyAclTensor(outputTensor);
-      destroyAclTensor(residualTensor);
-      destroyAclTensor(resultTensor);
-      aclDestroyScalar(alpha);
       throw StringError("aclnnAddGetWorkspaceSize failed for ResidualBlock " + name + " with error: " + to_string(status));
     }
 
     // Phase 2: Execute add
     status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
 
-    // Cleanup
-    destroyAclTensor(outputTensor);
-    destroyAclTensor(residualTensor);
-    destroyAclTensor(resultTensor);
-    aclDestroyScalar(alpha);
-
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for ResidualBlock " + name + " with error: " + to_string(status));
     }
-
-    (void)workspaceBytes;
   }
 };
 
@@ -1627,6 +1608,7 @@ struct GlobalPoolingResidualBlock {
   }
 
   void apply(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     const void* maskBuf,
@@ -1645,13 +1627,13 @@ struct GlobalPoolingResidualBlock {
 
     // Step 1: Apply pre NormActConv (preBN + preActivation + regularConv)
     // input -> regularOutBuf
-    preNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, regularOutBuf, workspaceBuf, workspaceBytes);
+    preNormActConv->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, regularOutBuf, workspaceBuf, workspaceBytes);
 
     // Step 2: Apply gpoolConv on input -> gpoolOutBuf
-    gpoolConv->apply(stream, batchSize, nnXLen, nnYLen, false, inputBuf, gpoolOutBuf, workspaceBuf, workspaceBytes);
+    gpoolConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, inputBuf, gpoolOutBuf, workspaceBuf, workspaceBytes);
 
     // Step 3: Apply gpoolBN on gpoolOutBuf (in-place)
-    gpoolBN->apply(stream, batchSize, gpoolOutBuf, maskBuf, gpoolOutBuf, workspaceBuf, workspaceBytes);
+    gpoolBN->apply(handle, stream, batchSize, gpoolOutBuf, maskBuf, gpoolOutBuf, workspaceBuf, workspaceBytes);
 
     // Step 4: Global pooling (mean, max, mean * sqrt(area))
     // For now, we'll use a simplified global average pooling
@@ -1667,7 +1649,7 @@ struct GlobalPoolingResidualBlock {
 
     // Step 5: Apply gpoolToBiasMul to get bias for regular branch
     // gpoolConcatBuf (batch, gpoolChannels*3) -> gpoolBiasBuf (batch, numChannels)
-    gpoolToBiasMul->apply(stream, batchSize, gpoolConcatBuf, gpoolBiasBuf, workspaceBuf, workspaceBytes);
+    gpoolToBiasMul->apply(handle, stream, batchSize, gpoolConcatBuf, gpoolBiasBuf, workspaceBuf, workspaceBytes);
 
     // Step 6: Add gpoolBias to regularOutBuf (broadcast bias across spatial dims)
     // TODO: Implement aclnnAdd with proper broadcasting
@@ -1675,7 +1657,7 @@ struct GlobalPoolingResidualBlock {
 
     // Step 7: Apply mid NormActConv (midBN + midActivation + finalConv) with residual
     // regularOutBuf -> inputBuf (output, with residual from original input)
-    midNormActConv->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, regularOutBuf, inputBuf, workspaceBuf, workspaceBytes);
+    midNormActConv->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf, regularOutBuf, inputBuf, workspaceBuf, workspaceBytes);
 
     // Step 8: Add residual connection
     // TODO: Implement residual add: inputBuf + scratchBuf -> inputBuf
@@ -1749,6 +1731,7 @@ struct Model {
   ~Model() {}
 
   void apply(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     bool requireExactNNLen,
@@ -1767,6 +1750,7 @@ struct Model {
 
 private:
   void applyTrunk(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     void* inputBuf,
@@ -1780,6 +1764,7 @@ private:
   ) const;
 
   void applyPolicyHead(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     const void* trunkOutputBuf,
@@ -1793,6 +1778,7 @@ private:
   ) const;
 
   void applyValueHead(
+    ComputeHandle* handle,
     aclrtStream stream,
     int batchSize,
     const void* trunkOutputBuf,
@@ -1901,6 +1887,7 @@ size_t Model::requiredWorkspaceBytes(int maxBatchSize) const {
 }
 
 void Model::apply(
+  ComputeHandle* handle,
   aclrtStream stream,
   int batchSize,
   bool requireExactNNLen,
@@ -1922,18 +1909,19 @@ void Model::apply(
   size_t workspaceBytes = buffers->workspaceBytes;
 
   // Apply trunk
-  applyTrunk(stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
+  applyTrunk(handle, stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
 
   // Apply policy head with pre-allocated buffers
-  applyPolicyHead(stream, batchSize, trunkOutputBuf, maskBuf, policyPassBuf, policyBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
+  applyPolicyHead(handle, stream, batchSize, trunkOutputBuf, maskBuf, policyPassBuf, policyBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
 
   // Apply value head with pre-allocated buffers
-  applyValueHead(stream, batchSize, trunkOutputBuf, maskBuf, valueBuf, scoreValueBuf, ownershipBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
+  applyValueHead(handle, stream, batchSize, trunkOutputBuf, maskBuf, valueBuf, scoreValueBuf, ownershipBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
 
   (void)requireExactNNLen;
 }
 
 void Model::applyTrunk(
+  ComputeHandle* handle,
   aclrtStream stream,
   int batchSize,
   void* inputBuf,
@@ -1946,7 +1934,7 @@ void Model::applyTrunk(
   size_t workspaceBytes
 ) const {
   // Apply initial convolution: input -> trunkOutput
-  initialConv->apply(stream, batchSize, nnXLen, nnYLen, false, inputBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
+  initialConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, inputBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
 
   // Apply initial matmul with global features
   // This adds the global features (and optional metadata features) to trunkOutput
@@ -1957,7 +1945,7 @@ void Model::applyTrunk(
   void* globalMulBuf = scratchBuf;  // Reuse scratch buffer for intermediate result
 
   // Apply matmul: (batch, numGlobalChannels) @ (numGlobalChannels, trunkChannels) -> (batch, trunkChannels)
-  initialMatMul->apply(stream, batchSize, inputGlobalBuf, globalMulBuf, workspaceBuf, workspaceBytes);
+  initialMatMul->apply(handle, stream, batchSize, inputGlobalBuf, globalMulBuf, workspaceBuf, workspaceBytes);
 
   // Add globalMulBuf to each spatial location of trunkOutput
   // trunkOutput is (batch, trunkChannels, nnYLen, nnXLen)
@@ -1966,33 +1954,24 @@ void Model::applyTrunk(
 
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
 
-  // Create tensors for add with broadcasting
+  // Create tensors for add with broadcasting using cache
   vector<int64_t> trunkShape = {batchSize, trunkNumChannels, nnYLen, nnXLen};
   vector<int64_t> biasShape = {batchSize, trunkNumChannels, 1, 1};  // Broadcast to NCHW
 
-  aclTensor* trunkTensor = createAclTensor(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
-  aclTensor* biasTensor = createAclTensor(globalMulBuf, biasShape, dtype, ACL_FORMAT_NCHW);
-  aclTensor* resultTensor = createAclTensor(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
-
-  // Create scalar for alpha
-  aclScalar* alpha = createFloatScalar(1.0f);
+  aclTensor* trunkTensor = handle->tensorCache.get(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
+  aclTensor* biasTensor = handle->tensorCache.get(globalMulBuf, biasShape, dtype, ACL_FORMAT_NCHW);
+  aclTensor* resultTensor = handle->tensorCache.get(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
 
   // Phase 1: Get workspace size for add
   uint64_t addWsSize = 0;
   aclOpExecutor* addExecutor = nullptr;
 
-  aclnnStatus status = aclnnAddGetWorkspaceSize(trunkTensor, biasTensor, alpha, resultTensor, &addWsSize, &addExecutor);
+  aclnnStatus status = aclnnAddGetWorkspaceSize(trunkTensor, biasTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
 
   if(status == ACLNN_SUCCESS) {
     // Phase 2: Execute add
     status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
   }
-
-  // Cleanup
-  destroyAclTensor(trunkTensor);
-  destroyAclTensor(biasTensor);
-  destroyAclTensor(resultTensor);
-  aclDestroyScalar(alpha);
 
   if(status != ACLNN_SUCCESS) {
     throw StringError("aclnnAdd failed for initial global features with error: " + to_string(status));
@@ -2014,7 +1993,7 @@ void Model::applyTrunk(
 
   // Apply residual blocks
   for(const auto& block : residualBlocks) {
-    block->apply(stream, batchSize, nnXLen, nnYLen, maskBuf, trunkOutputBuf, trunkOutputBuf, scratchBuf, workspaceBuf, workspaceBytes);
+    block->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf, trunkOutputBuf, trunkOutputBuf, scratchBuf, workspaceBuf, workspaceBytes);
   }
 
   // Apply global pooling residual blocks
@@ -2022,12 +2001,13 @@ void Model::applyTrunk(
   // TODO: Implement gpoolBlocks with maskSumBuf
 
   // Apply trunk tip BN
-  trunkTipBN->apply(stream, batchSize, trunkOutputBuf, maskBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
+  trunkTipBN->apply(handle, stream, batchSize, trunkOutputBuf, maskBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
 
   (void)scratchBuf;
 }
 
 void Model::applyPolicyHead(
+  ComputeHandle* handle,
   aclrtStream stream,
   int batchSize,
   const void* trunkOutputBuf,
@@ -2053,13 +2033,13 @@ void Model::applyPolicyHead(
   void* p1PassBuf = buffers->p1PassBuf;
 
   // Step 1: Apply p1Conv: trunk -> p1Out
-  p1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
+  p1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
 
   // Step 2: Apply g1Conv: trunk -> g1Out
-  g1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), g1OutBuf, workspaceBuf, workspaceBytes);
+  g1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), g1OutBuf, workspaceBuf, workspaceBytes);
 
   // Step 3: Apply g1BN: g1Out -> g1Out2
-  g1BN->apply(stream, batchSize, g1OutBuf, maskBuf, g1Out2Buf, workspaceBuf, workspaceBytes);
+  g1BN->apply(handle, stream, batchSize, g1OutBuf, maskBuf, g1Out2Buf, workspaceBuf, workspaceBytes);
 
   // Step 4: Global pooling on g1Out2 -> g1Concat
   // This computes: mean, max, mean * sqrt(area) and concatenates them
@@ -2068,7 +2048,7 @@ void Model::applyPolicyHead(
   // In practice, we need custom kernels for this or implement with ACLNN operations
 
   // Step 5: Apply gpoolToBiasMul: g1Concat -> g1Bias
-  gpoolToBiasMul->apply(stream, batchSize, g1ConcatBuf, g1BiasBuf, workspaceBuf, workspaceBytes);
+  gpoolToBiasMul->apply(handle, stream, batchSize, g1ConcatBuf, g1BiasBuf, workspaceBuf, workspaceBytes);
 
   // Step 6: Add g1Bias to p1Out (broadcast across spatial dims)
   // g1Bias is (batch, p1Channels, 1, 1), p1Out is (batch, p1Channels, nnYLen, nnXLen)
@@ -2076,22 +2056,16 @@ void Model::applyPolicyHead(
     vector<int64_t> p1OutShape = {batchSize, p1Channels, nnYLen, nnXLen};
     vector<int64_t> biasShape = {batchSize, p1Channels, 1, 1};  // Broadcast to NCHW
 
-    aclTensor* p1OutTensor = createAclTensor(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
-    aclTensor* biasTensor = createAclTensor(g1BiasBuf, biasShape, ACL_FLOAT, ACL_FORMAT_NCHW);
-    aclTensor* resultTensor = createAclTensor(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
-    aclScalar* alpha = createFloatScalar(1.0f);
+    aclTensor* p1OutTensor = handle->tensorCache.get(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* biasTensor = handle->tensorCache.get(g1BiasBuf, biasShape, ACL_FLOAT, ACL_FORMAT_NCHW);
+    aclTensor* resultTensor = handle->tensorCache.get(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
 
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
-    aclnnStatus status = aclnnAddGetWorkspaceSize(p1OutTensor, biasTensor, alpha, resultTensor, &addWsSize, &addExecutor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(p1OutTensor, biasTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
     if(status == ACLNN_SUCCESS && addWsSize <= workspaceBytes) {
       aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
     }
-
-    destroyAclTensor(p1OutTensor);
-    destroyAclTensor(biasTensor);
-    destroyAclTensor(resultTensor);
-    aclDestroyScalar(alpha);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for policy head bias with error: " + to_string(status));
@@ -2099,28 +2073,28 @@ void Model::applyPolicyHead(
   }
 
   // Step 7: Apply p1BN: p1Out -> scratchBuf
-  p1BN->apply(stream, batchSize, p1OutBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
+  p1BN->apply(handle, stream, batchSize, p1OutBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
 
   // Step 8: Apply p2Conv: scratchBuf -> policyBuf
-  p2Conv->apply(stream, batchSize, nnXLen, nnYLen, false, scratchBuf, policyBuf, workspaceBuf, workspaceBytes);
+  p2Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, scratchBuf, policyBuf, workspaceBuf, workspaceBytes);
 
   // Step 9: Compute policy pass logit
   // gpoolToPassMul: g1Concat -> p1PassBuf
   // gpoolToPassBias: p1PassBuf (in-place)
   // gpoolToPassMul2: p1PassBuf -> policyPassBuf (if modelVersion >= 15)
   if(modelVersion >= 15) {
-    gpoolToPassMul->apply(stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-    gpoolToPassBias->apply(stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-    gpoolToPassMul2->apply(stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
+    gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+    gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+    gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
   } else {
-    gpoolToPassMul->apply(stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
+    gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
   }
 
-  // No ascendFree calls - all buffers are pre-allocated in Buffers struct
   (void)dtype;
 }
 
 void Model::applyValueHead(
+  ComputeHandle* handle,
   aclrtStream stream,
   int batchSize,
   const void* trunkOutputBuf,
@@ -2146,10 +2120,10 @@ void Model::applyValueHead(
   void* ownershipScratchBuf = buffers->ownershipScratchBuf;
 
   // Step 1: Apply v1Conv: trunk -> v1Out
-  v1Conv->apply(stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), v1OutBuf, workspaceBuf, workspaceBytes);
+  v1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), v1OutBuf, workspaceBuf, workspaceBytes);
 
   // Step 2: Apply v1BN: v1Out -> v1Out2
-  v1BN->apply(stream, batchSize, v1OutBuf, maskBuf, v1Out2Buf, workspaceBuf, workspaceBytes);
+  v1BN->apply(handle, stream, batchSize, v1OutBuf, maskBuf, v1Out2Buf, workspaceBuf, workspaceBytes);
 
   // Step 3: Global pooling on v1Out2 -> v1Mean
   // TODO: Implement proper global pooling with mean, max, sqrt-area statistics
@@ -2160,7 +2134,7 @@ void Model::applyValueHead(
 
   // For now, zero-initialize v1MeanBuf using aclnnFillScalar
   {
-    aclTensor* v1MeanTensor = createAclTensor(v1MeanBuf, {batchSize, v1Channels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclTensor* v1MeanTensor = handle->tensorCache.get(v1MeanBuf, {batchSize, v1Channels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
     aclScalar* zeroScalar = createAclScalar(0.0f, ACL_FLOAT);
 
     uint64_t fillWsSize = 0;
@@ -2169,8 +2143,6 @@ void Model::applyValueHead(
     if(status == ACLNN_SUCCESS) {
       status = aclnnInplaceFillScalar(workspaceBuf, fillWsSize, fillExecutor, stream);
     }
-
-    destroyAclTensor(v1MeanTensor);
     aclDestroyScalar(zeroScalar);
 
     if(status != ACLNN_SUCCESS) {
@@ -2179,30 +2151,30 @@ void Model::applyValueHead(
   }
 
   // Step 4: Apply v2Mul: v1Mean -> v2Out
-  v2Mul->apply(stream, batchSize, v1MeanBuf, v2OutBuf, workspaceBuf, workspaceBytes);
+  v2Mul->apply(handle, stream, batchSize, v1MeanBuf, v2OutBuf, workspaceBuf, workspaceBytes);
 
   // Step 5: Apply v2Bias: v2Out -> v2Out (in-place)
-  v2Bias->apply(stream, batchSize, v2OutBuf, v2OutBuf, workspaceBuf, workspaceBytes);
+  v2Bias->apply(handle, stream, batchSize, v2OutBuf, v2OutBuf, workspaceBuf, workspaceBytes);
 
   // Step 6: Apply v3Mul: v2Out -> valueBuf
-  v3Mul->apply(stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
+  v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
 
   // Step 7: Apply v3Bias: valueBuf -> valueBuf (in-place)
-  v3Bias->apply(stream, batchSize, valueBuf, valueBuf, workspaceBuf, workspaceBytes);
+  v3Bias->apply(handle, stream, batchSize, valueBuf, valueBuf, workspaceBuf, workspaceBytes);
 
   // Step 8: Apply sv3Mul: v2Out -> scoreValueBuf
-  sv3Mul->apply(stream, batchSize, v2OutBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
+  sv3Mul->apply(handle, stream, batchSize, v2OutBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
 
   // Step 9: Apply sv3Bias: scoreValueBuf -> scoreValueBuf (in-place)
-  sv3Bias->apply(stream, batchSize, scoreValueBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
+  sv3Bias->apply(handle, stream, batchSize, scoreValueBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
 
   // Step 10: Apply vOwnershipConv: v1Out2 -> ownershipBuf
   // If using FP16, output to ownershipScratchBuf first, then convert to FP32
   if(useFP16) {
-    vOwnershipConv->apply(stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipScratchBuf, workspaceBuf, workspaceBytes);
+    vOwnershipConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipScratchBuf, workspaceBuf, workspaceBytes);
     // Convert FP16 to FP32 for final output
-    aclTensor* srcTensor = createAclTensor(ownershipScratchBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
-    aclTensor* dstTensor = createAclTensor(ownershipBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    aclTensor* srcTensor = handle->tensorCache.get(ownershipScratchBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
+    aclTensor* dstTensor = handle->tensorCache.get(ownershipBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
 
     uint64_t castWsSize = 0;
     aclOpExecutor* castExecutor = nullptr;
@@ -2210,13 +2182,10 @@ void Model::applyValueHead(
     if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
       aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
     }
-    destroyAclTensor(srcTensor);
-    destroyAclTensor(dstTensor);
   } else {
-    vOwnershipConv->apply(stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipBuf, workspaceBuf, workspaceBytes);
+    vOwnershipConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipBuf, workspaceBuf, workspaceBytes);
   }
 
-  // No ascendFree calls - all buffers are pre-allocated in Buffers struct
   (void)dtype;
 }
 
@@ -2300,6 +2269,9 @@ ComputeHandle* NeuralNet::createComputeHandle(
     delete handle;
     throw StringError("aclrtCreateStream failed with error: " + to_string(ret));
   }
+
+  // Initialize cached scalars (alpha=1.0 for Add operations)
+  handle->initScalars();
 
   // Log device assignment for multi-NPU debugging
   if(logger != nullptr) {
@@ -2424,9 +2396,9 @@ void NeuralNet::getOutput(
 
     // Convert spatial input
     {
-      aclTensor* srcTensor = createAclTensor(buffers->inputBufFloat,
+      aclTensor* srcTensor = gpuHandle->tensorCache.get(buffers->inputBufFloat,
         {batchSize, numSpatialFeatures, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
-      aclTensor* dstTensor = createAclTensor(buffers->inputBuf,
+      aclTensor* dstTensor = gpuHandle->tensorCache.get(buffers->inputBuf,
         {batchSize, numSpatialFeatures, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
 
       uint64_t castWsSize = 0;
@@ -2435,8 +2407,6 @@ void NeuralNet::getOutput(
       if(status == ACLNN_SUCCESS) {
         status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
       }
-      destroyAclTensor(srcTensor);
-      destroyAclTensor(dstTensor);
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnCast failed for spatial input with error: " + to_string(status));
       }
@@ -2444,9 +2414,9 @@ void NeuralNet::getOutput(
 
     // Convert global input
     {
-      aclTensor* srcTensor = createAclTensor(buffers->inputGlobalBufFloat,
+      aclTensor* srcTensor = gpuHandle->tensorCache.get(buffers->inputGlobalBufFloat,
         {batchSize, numGlobalFeatures}, ACL_FLOAT, ACL_FORMAT_ND);
-      aclTensor* dstTensor = createAclTensor(buffers->inputGlobalBuf,
+      aclTensor* dstTensor = gpuHandle->tensorCache.get(buffers->inputGlobalBuf,
         {batchSize, numGlobalFeatures}, ACL_FLOAT16, ACL_FORMAT_ND);
 
       uint64_t castWsSize = 0;
@@ -2455,8 +2425,6 @@ void NeuralNet::getOutput(
       if(status == ACLNN_SUCCESS) {
         status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
       }
-      destroyAclTensor(srcTensor);
-      destroyAclTensor(dstTensor);
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnCast failed for global input with error: " + to_string(status));
       }
@@ -2464,9 +2432,9 @@ void NeuralNet::getOutput(
 
     // Convert meta input if present
     if(numMetaFeatures > 0) {
-      aclTensor* srcTensor = createAclTensor(buffers->inputMetaBufFloat,
+      aclTensor* srcTensor = gpuHandle->tensorCache.get(buffers->inputMetaBufFloat,
         {batchSize, numMetaFeatures}, ACL_FLOAT, ACL_FORMAT_ND);
-      aclTensor* dstTensor = createAclTensor(buffers->inputMetaBuf,
+      aclTensor* dstTensor = gpuHandle->tensorCache.get(buffers->inputMetaBuf,
         {batchSize, numMetaFeatures}, ACL_FLOAT16, ACL_FORMAT_ND);
 
       uint64_t castWsSize = 0;
@@ -2475,8 +2443,6 @@ void NeuralNet::getOutput(
       if(status == ACLNN_SUCCESS) {
         status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
       }
-      destroyAclTensor(srcTensor);
-      destroyAclTensor(dstTensor);
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnCast failed for meta input with error: " + to_string(status));
       }
@@ -2485,6 +2451,7 @@ void NeuralNet::getOutput(
 
   // Run model inference
   gpuHandle->model->apply(
+    gpuHandle,
     gpuHandle->stream,
     batchSize,
     gpuHandle->requireExactNNLen,
