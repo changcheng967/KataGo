@@ -3,7 +3,7 @@
 #include "../neuralnet/nninterface.h"
 
 #include "acl/acl.h"
-#include "acl/acl_rt.h"  // Graph capture/replay APIs (aclmdlRI*)
+#include "acl/acl_rt.h"
 #include "aclnn/aclnn_base.h"
 // ACLNN operator headers (from aclnnop directory)
 // Note: inplace variants are declared in the same header as non-inplace
@@ -407,12 +407,6 @@ struct ComputeHandle {
   // Cached alpha=1.0 scalar for Add operations
   aclScalar* alphaOneScalar;
 
-  // Graph capture cache - batchSize -> captured graph
-  // Collapses ~200 kernel launches per forward pass into single graph replay
-  std::unordered_map<int, aclmdlRI> graphCache;
-  bool graphCaptureEnabled;
-  bool graphCaptureWarningLogged;
-
   ComputeHandle() = delete;
   ComputeHandle(const ComputeHandle&) = delete;
   ComputeHandle& operator=(const ComputeHandle&) = delete;
@@ -428,29 +422,14 @@ struct ComputeHandle {
       nnYLen(nnY),
       requireExactNNLen(exactLen),
       inputsUseNHWC(nhwc),
-      alphaOneScalar(nullptr),
-      graphCaptureEnabled(true),
-      graphCaptureWarningLogged(false)
+      alphaOneScalar(nullptr)
   {
-    // Allow disabling graph capture via environment variable
-    const char* envDisable = getenv("KATAGO_DISABLE_GRAPH_CAPTURE");
-    if(envDisable != nullptr && std::string(envDisable) == "1") {
-      graphCaptureEnabled = false;
-    }
   }
 
   ~ComputeHandle() {
     // Set device context first since destructor may run on a different thread
     // CANN's device binding is thread-local
     aclrtSetDevice(deviceIdx);
-
-    // Destroy cached graphs
-    for(auto& p : graphCache) {
-      if(p.second != nullptr) {
-        aclmdlRIDestroy(p.second);
-      }
-    }
-    graphCache.clear();
 
     if(alphaOneScalar != nullptr) {
       aclDestroyScalar(alphaOneScalar);
@@ -2477,127 +2456,18 @@ void NeuralNet::getOutput(
     }
   }
 
-  // Ensure all input copies/casts complete before graph replay
+  // Ensure all input copies/casts complete before inference
   aclrtSynchronizeStream(gpuHandle->stream);
 
   // ========================================================================
-  // PHASE 2: Run model inference with graph capture/replay
+  // PHASE 2: Run model inference (eager execution)
   // ========================================================================
-  auto graphIt = gpuHandle->graphCache.find(batchSize);
-
-  if(graphIt != gpuHandle->graphCache.end() && gpuHandle->graphCaptureEnabled) {
-    // REPLAY: Launch the cached graph - collapses ~200 kernel launches into single call
-    aclError graphErr = aclmdlRIExecuteAsync(graphIt->second, gpuHandle->stream);
-    if(graphErr != ACL_SUCCESS) {
-      // Graph replay failed - fall back to eager execution
-      if(!gpuHandle->graphCaptureWarningLogged) {
-        cerr << "Warning: Graph replay failed on device " << gpuHandle->deviceIdx
-             << ", batchSize=" << batchSize << ", error=" << graphErr
-             << ". Falling back to eager execution." << endl;
-        gpuHandle->graphCaptureWarningLogged = true;
-      }
-      aclmdlRIDestroy(graphIt->second);
-      gpuHandle->graphCache.erase(graphIt);
-      gpuHandle->graphCaptureEnabled = false;
-
-      // Run eager execution as fallback
-      gpuHandle->model->apply(
-        gpuHandle, gpuHandle->stream, batchSize, gpuHandle->requireExactNNLen,
-        buffers->inputBuf, buffers->inputGlobalBuf, buffers->inputMetaBuf,
-        buffers->policyPassBuf, buffers->policyBuf, buffers->valueBuf,
-        buffers->scoreValueBuf, buffers->ownershipBuf, buffers
-      );
-    }
-  } else if(gpuHandle->graphCaptureEnabled) {
-    // CAPTURE: Record the forward pass into a graph
-    aclError captureErr = aclmdlRICaptureBegin(gpuHandle->stream, ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
-
-    if(captureErr != ACL_SUCCESS) {
-      // Capture begin failed - try GLOBAL mode, then disable if that fails too
-      captureErr = aclmdlRICaptureBegin(gpuHandle->stream, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL);
-
-      if(captureErr != ACL_SUCCESS) {
-        if(!gpuHandle->graphCaptureWarningLogged) {
-          cerr << "Warning: Graph capture not supported on device " << gpuHandle->deviceIdx
-               << " (error=" << captureErr << "). Running in eager mode." << endl;
-          gpuHandle->graphCaptureWarningLogged = true;
-        }
-        gpuHandle->graphCaptureEnabled = false;
-
-        // Run eager execution
-        gpuHandle->model->apply(
-          gpuHandle, gpuHandle->stream, batchSize, gpuHandle->requireExactNNLen,
-          buffers->inputBuf, buffers->inputGlobalBuf, buffers->inputMetaBuf,
-          buffers->policyPassBuf, buffers->policyBuf, buffers->valueBuf,
-          buffers->scoreValueBuf, buffers->ownershipBuf, buffers
-        );
-      }
-    }
-
-    if(gpuHandle->graphCaptureEnabled) {
-      // Run the forward pass (this will be captured)
-      gpuHandle->model->apply(
-        gpuHandle, gpuHandle->stream, batchSize, gpuHandle->requireExactNNLen,
-        buffers->inputBuf, buffers->inputGlobalBuf, buffers->inputMetaBuf,
-        buffers->policyPassBuf, buffers->policyBuf, buffers->valueBuf,
-        buffers->scoreValueBuf, buffers->ownershipBuf, buffers
-      );
-
-      // End capture and store the graph
-      aclmdlRI capturedGraph = nullptr;
-      aclError endErr = aclmdlRICaptureEnd(gpuHandle->stream, &capturedGraph);
-
-      if(endErr == ACL_SUCCESS && capturedGraph != nullptr) {
-        gpuHandle->graphCache[batchSize] = capturedGraph;
-
-        // Replay the captured graph to actually execute (capture only records)
-        aclError replayErr = aclmdlRIExecuteAsync(capturedGraph, gpuHandle->stream);
-        if(replayErr != ACL_SUCCESS) {
-          // Replay failed - destroy graph and fall back
-          if(!gpuHandle->graphCaptureWarningLogged) {
-            cerr << "Warning: Graph replay failed after capture on device " << gpuHandle->deviceIdx
-                 << ", error=" << replayErr << ". Falling back to eager execution." << endl;
-            gpuHandle->graphCaptureWarningLogged = true;
-          }
-          aclmdlRIDestroy(capturedGraph);
-          gpuHandle->graphCache.erase(batchSize);
-          gpuHandle->graphCaptureEnabled = false;
-
-          // Re-run eager since capture didn't execute
-          gpuHandle->model->apply(
-            gpuHandle, gpuHandle->stream, batchSize, gpuHandle->requireExactNNLen,
-            buffers->inputBuf, buffers->inputGlobalBuf, buffers->inputMetaBuf,
-            buffers->policyPassBuf, buffers->policyBuf, buffers->valueBuf,
-            buffers->scoreValueBuf, buffers->ownershipBuf, buffers
-          );
-        }
-      } else {
-        // Capture end failed - disable and run eager
-        if(!gpuHandle->graphCaptureWarningLogged) {
-          cerr << "Warning: Graph capture end failed on device " << gpuHandle->deviceIdx
-               << ", error=" << endErr << ". Falling back to eager execution." << endl;
-          gpuHandle->graphCaptureWarningLogged = true;
-        }
-        gpuHandle->graphCaptureEnabled = false;
-
-        // Re-run eager since capture didn't execute
-        gpuHandle->model->apply(
-          gpuHandle, gpuHandle->stream, batchSize, gpuHandle->requireExactNNLen,
-          buffers->inputBuf, buffers->inputGlobalBuf, buffers->inputMetaBuf,
-          buffers->policyPassBuf, buffers->policyBuf, buffers->valueBuf,
-          buffers->scoreValueBuf, buffers->ownershipBuf, buffers
-        );
-      }
-    }
-  } else {
-    // Graph capture disabled - run eager execution
-    gpuHandle->model->apply(
-      gpuHandle, gpuHandle->stream, batchSize, gpuHandle->requireExactNNLen,
-      buffers->inputBuf, buffers->inputGlobalBuf, buffers->inputMetaBuf,
-      buffers->policyPassBuf, buffers->policyBuf, buffers->valueBuf,
-      buffers->scoreValueBuf, buffers->ownershipBuf, buffers
-    );
-  }
+  gpuHandle->model->apply(
+    gpuHandle, gpuHandle->stream, batchSize, gpuHandle->requireExactNNLen,
+    buffers->inputBuf, buffers->inputGlobalBuf, buffers->inputMetaBuf,
+    buffers->policyPassBuf, buffers->policyBuf, buffers->valueBuf,
+    buffers->scoreValueBuf, buffers->ownershipBuf, buffers
+  );
 
   // Synchronize before copying results back
   // This is critical for multi-NPU stability - ensures all ops complete before D2H copies
