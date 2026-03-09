@@ -197,6 +197,26 @@ static void* ascendMallocAndCopy(const void* hostData, size_t size) {
   return devicePtr;
 }
 
+// Allocate device memory with FP16 conversion: convert float[] on host to aclFloat16[], then upload
+// This is the key optimization for Ascend 910ProA - native FP16 weights eliminate per-op conversion
+static void* ascendMallocAndCopyFP16(const float* hostData, size_t numElements) {
+  if(numElements == 0 || hostData == nullptr) return nullptr;
+  // Convert to FP16 on host using CANN's conversion function
+  vector<aclFloat16> fp16Data(numElements);
+  for(size_t i = 0; i < numElements; i++) {
+    fp16Data[i] = aclFloatToFloat16(hostData[i]);
+  }
+  size_t fp16Bytes = numElements * sizeof(aclFloat16);
+  void* devicePtr = ascendMalloc(fp16Bytes);
+  ascendCopyH2D(devicePtr, fp16Data.data(), fp16Bytes);
+  return devicePtr;
+}
+
+// Overload for vector<float>
+static void* ascendMallocAndCopyFP16(const vector<float>& hostData) {
+  return ascendMallocAndCopyFP16(hostData.data(), hostData.size());
+}
+
 
 //---------------------------------------------------------------------------------
 // LoadedModel - simple wrapper around ModelDesc
@@ -690,6 +710,7 @@ struct ConvLayer {
   void* filterBuf;              // Device memory for weights (NCHW: outC, inC, H, W)
   aclDataType dtype;
   bool useFP16;
+  int8_t cubeMathType;          // 0=KEEP_DTYPE (native FP16), 1=ALLOW_FP32_DOWN_PRECISION
 
   ConvLayer() = delete;
   ConvLayer(const ConvLayer&) = delete;
@@ -705,19 +726,17 @@ struct ConvLayer {
       dilationX(desc->dilationX),
       useFP16(useFP16_)
   {
-    dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
-
-    // Allocate and copy weights to device
+    // Allocate and copy weights to device with native FP16 conversion
     // KataGo weights are in (outC, inC, H, W) format which is NCHW-compatible
-    size_t weightBytes = desc->weights.size() * sizeof(float);
     if(useFP16) {
-      // TODO: Convert to FP16
-      // For now, use float
-      filterBuf = ascendMallocAndCopy(desc->weights.data(), weightBytes);
-      dtype = ACL_FLOAT;
+      filterBuf = ascendMallocAndCopyFP16(desc->weights.data(), desc->weights.size());
+      dtype = ACL_FLOAT16;
+      cubeMathType = 0;  // KEEP_DTYPE - weights are already native FP16
     } else {
+      size_t weightBytes = desc->weights.size() * sizeof(float);
       filterBuf = ascendMallocAndCopy(desc->weights.data(), weightBytes);
       dtype = ACL_FLOAT;
+      cubeMathType = 1;  // ALLOW_FP32_DOWN_PRECISION - let CANN convert FP32->FP16
     }
   }
 
@@ -765,7 +784,7 @@ struct ConvLayer {
       outputPaddingArr,
       (int64_t)1,     // groups
       outputTensor,
-      ASCEND_CUBE_MATH_TYPE,      // cubeMathType
+      cubeMathType,      // cubeMathType: 0 for native FP16, 1 for FP32->FP16 conversion
       &workspaceSize,
       &executor
     );
@@ -848,7 +867,7 @@ struct ConvLayer {
       outputPaddingArr,
       (int64_t)1,     // groups
       outputTensor,
-      ASCEND_CUBE_MATH_TYPE,      // cubeMathType
+      cubeMathType,      // cubeMathType: 0 for native FP16, 1 for FP32->FP16 conversion
       &wsSize,
       &executor
     );
@@ -914,13 +933,16 @@ struct BatchNormLayer {
       nnXLen(nnX),
       nnYLen(nnY)
   {
-    // Allocate and copy merged scale and bias
-    // For now, use float (TODO: FP16 support)
-    size_t scaleBytes = desc->mergedScale.size() * sizeof(float);
-    size_t biasBytes = desc->mergedBias.size() * sizeof(float);
-
-    mergedScaleBuf = ascendMallocAndCopy(desc->mergedScale.data(), scaleBytes);
-    mergedBiasBuf = ascendMallocAndCopy(desc->mergedBias.data(), biasBytes);
+    // Allocate and copy merged scale and bias with native FP16 conversion
+    if(useFP16) {
+      mergedScaleBuf = ascendMallocAndCopyFP16(desc->mergedScale);
+      mergedBiasBuf = ascendMallocAndCopyFP16(desc->mergedBias);
+    } else {
+      size_t scaleBytes = desc->mergedScale.size() * sizeof(float);
+      size_t biasBytes = desc->mergedBias.size() * sizeof(float);
+      mergedScaleBuf = ascendMallocAndCopy(desc->mergedScale.data(), scaleBytes);
+      mergedBiasBuf = ascendMallocAndCopy(desc->mergedBias.data(), biasBytes);
+    }
   }
 
   ~BatchNormLayer() {
@@ -1128,6 +1150,7 @@ struct MatMulLayer {
 
   void* matBuf;  // Device memory for weights
   bool useFP16;
+  int8_t cubeMathType;  // 0=KEEP_DTYPE (native FP16), 1=ALLOW_FP32_DOWN_PRECISION
 
   MatMulLayer() = delete;
   MatMulLayer(const MatMulLayer&) = delete;
@@ -1140,8 +1163,15 @@ struct MatMulLayer {
       useFP16(useFP16_)
   {
     // Weights are in (inC, outC) format
-    size_t weightBytes = desc->weights.size() * sizeof(float);
-    matBuf = ascendMallocAndCopy(desc->weights.data(), weightBytes);
+    // Allocate and copy with native FP16 conversion for optimal performance
+    if(useFP16) {
+      matBuf = ascendMallocAndCopyFP16(desc->weights.data(), desc->weights.size());
+      cubeMathType = 0;  // KEEP_DTYPE - weights are already native FP16
+    } else {
+      size_t weightBytes = desc->weights.size() * sizeof(float);
+      matBuf = ascendMallocAndCopy(desc->weights.data(), weightBytes);
+      cubeMathType = 1;  // ALLOW_FP32_DOWN_PRECISION - let CANN convert FP32->FP16
+    }
   }
 
   ~MatMulLayer() {
@@ -1183,7 +1213,7 @@ struct MatMulLayer {
       inputTensor,
       weightTensor,
       outputTensor,
-      ASCEND_CUBE_MATH_TYPE,       // cubeMathType
+      cubeMathType,       // cubeMathType: 0 for native FP16, 1 for FP32->FP16 conversion
       &wsSize,
       &executor
     );
@@ -1236,8 +1266,13 @@ struct MatBiasLayer {
       numChannels(desc->numChannels),
       useFP16(useFP16_)
   {
-    size_t biasBytes = desc->weights.size() * sizeof(float);
-    biasBuf = ascendMallocAndCopy(desc->weights.data(), biasBytes);
+    // Allocate and copy bias with native FP16 conversion
+    if(useFP16) {
+      biasBuf = ascendMallocAndCopyFP16(desc->weights.data(), desc->weights.size());
+    } else {
+      size_t biasBytes = desc->weights.size() * sizeof(float);
+      biasBuf = ascendMallocAndCopy(desc->weights.data(), biasBytes);
+    }
   }
 
   ~MatBiasLayer() {
@@ -2201,14 +2236,14 @@ ComputeHandle* NeuralNet::createComputeHandle(
 
   int deviceIdx = (gpuIdxForThisThread == -1) ? 0 : gpuIdxForThisThread;
 
-  // Determine FP16 mode
-  bool useFP16 = false;
+  // Determine FP16 mode - Ascend 910ProA is optimized for FP16
+  // Enable by default for maximum performance
+  bool useFP16 = true;
   if(context->useFP16Mode == enabled_t::True)
     useFP16 = true;
   else if(context->useFP16Mode == enabled_t::False)
     useFP16 = false;
-  else // auto
-    useFP16 = false; // Default to FP32 until FP16 weight conversion is implemented
+  // else auto -> use FP16 (already set to true above)
 
   ComputeHandle* handle = new ComputeHandle(
     deviceIdx, useFP16, context->nnXLen, context->nnYLen, requireExactNNLen, inputsUseNHWC
