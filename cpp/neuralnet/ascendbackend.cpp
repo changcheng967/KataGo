@@ -799,16 +799,6 @@ struct ConvLayer {
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
-    // Debug logging
-    cout << "Ascend ConvLayer::apply " << name
-         << " batch=" << batchSize << " inC=" << inChannels << " outC=" << outChannels
-         << " board=" << nnYLen << "x" << nnXLen
-         << " filter=" << convYSize << "x" << convXSize
-         << " dilation=" << dilationY << "x" << dilationX
-         << " dtype=" << (dtype == ACL_FLOAT16 ? "FP16" : "FP32")
-         << " accumulate=" << accumulate
-         << endl;
-
     // Create tensors
     vector<int64_t> inputShape = {batchSize, inChannels, nnYLen, nnXLen};
     vector<int64_t> outputShape = {batchSize, outChannels, nnYLen, nnXLen};
@@ -953,13 +943,13 @@ struct BatchNormLayer {
     aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
 
     // Step 1: Multiply input by scale
-    // input: (N, C, H, W), scale: (C,) -> output: (N, C, H, W)
+    // input: (N, C, H, W), scale: (1, C, 1, 1) -> output: (N, C, H, W)
     {
       vector<int64_t> inputShape = {batchSize, numChannels, nnYLen, nnXLen};
-      vector<int64_t> scaleShape = {numChannels};
+      vector<int64_t> scaleShape = {1, numChannels, 1, 1};  // Broadcast to NCHW
 
       aclTensor* inputTensor = createAclTensor(inputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
-      aclTensor* scaleTensor = createAclTensor(mergedScaleBuf, scaleShape, dtype, ACL_FORMAT_ND);
+      aclTensor* scaleTensor = createAclTensor(mergedScaleBuf, scaleShape, dtype, ACL_FORMAT_NCHW);
       aclTensor* outputTensor = createAclTensor(outputBuf, inputShape, dtype, ACL_FORMAT_NCHW);
 
       // Two-phase pattern for mul
@@ -990,10 +980,10 @@ struct BatchNormLayer {
     // Step 2: Add bias
     {
       vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
-      vector<int64_t> biasShape = {numChannels};
+      vector<int64_t> biasShape = {1, numChannels, 1, 1};  // Broadcast to NCHW
 
       aclTensor* outputTensor = createAclTensor(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
-      aclTensor* biasTensor = createAclTensor(mergedBiasBuf, biasShape, dtype, ACL_FORMAT_ND);
+      aclTensor* biasTensor = createAclTensor(mergedBiasBuf, biasShape, dtype, ACL_FORMAT_NCHW);
       aclScalar* alpha = createFloatScalar(1.0f);
 
       uint64_t addWsSize = 0;
@@ -1227,8 +1217,8 @@ struct MatBiasLayer {
     vector<int64_t> inputShape = {batchSize, numChannels};
     aclTensor* inputTensor = createAclTensor(inputBuf, inputShape, dtype, ACL_FORMAT_ND);
 
-    // Create bias tensor: (C,) - will be broadcast
-    vector<int64_t> biasShape = {numChannels};
+    // Create bias tensor: (1, C) - will broadcast across batch
+    vector<int64_t> biasShape = {1, numChannels};
     aclTensor* biasTensor = createAclTensor(biasBuf, biasShape, dtype, ACL_FORMAT_ND);
 
     // Create output tensor: (N, C)
@@ -1808,13 +1798,6 @@ void Model::applyTrunk(
   size_t workspaceBytes
 ) const {
   // Apply initial convolution: input -> trunkOutput
-  cout << "Ascend: initialConv apply batchSize=" << batchSize
-       << " nnXLen=" << nnXLen << " nnYLen=" << nnYLen
-       << " inC=" << initialConv->inChannels
-       << " outC=" << initialConv->outChannels
-       << " filterSize=" << initialConv->convYSize << "x" << initialConv->convXSize
-       << " useFP16=" << useFP16
-       << endl;
   initialConv->apply(stream, batchSize, nnXLen, nnYLen, false, inputBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
 
   // Apply initial matmul with global features
@@ -1837,10 +1820,10 @@ void Model::applyTrunk(
 
   // Create tensors for add with broadcasting
   vector<int64_t> trunkShape = {batchSize, trunkNumChannels, nnYLen, nnXLen};
-  vector<int64_t> biasShape = {batchSize, trunkNumChannels};  // Will be broadcast
+  vector<int64_t> biasShape = {batchSize, trunkNumChannels, 1, 1};  // Broadcast to NCHW
 
   aclTensor* trunkTensor = createAclTensor(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
-  aclTensor* biasTensor = createAclTensor(globalMulBuf, biasShape, dtype, ACL_FORMAT_ND);
+  aclTensor* biasTensor = createAclTensor(globalMulBuf, biasShape, dtype, ACL_FORMAT_NCHW);
   aclTensor* resultTensor = createAclTensor(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
 
   // Create scalar for alpha
@@ -1907,11 +1890,6 @@ void Model::applyPolicyHead(
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
-  cout << "Ascend: applyPolicyHead batchSize=" << batchSize
-       << " p1Channels=" << p1Conv->outChannels
-       << " g1Channels=" << g1Conv->outChannels
-       << " useFP16=" << useFP16
-       << endl;
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   int p1Channels = p1Conv->outChannels;
   int g1Channels = g1Conv->outChannels;
@@ -1950,13 +1928,13 @@ void Model::applyPolicyHead(
   gpoolToBiasMul->apply(stream, batchSize, g1ConcatBuf, g1BiasBuf, workspaceBuf, workspaceBytes);
 
   // Step 6: Add g1Bias to p1Out (broadcast across spatial dims)
-  // g1Bias is (batch, p1Channels), p1Out is (batch, p1Channels, nnYLen, nnXLen)
+  // g1Bias is (batch, p1Channels, 1, 1), p1Out is (batch, p1Channels, nnYLen, nnXLen)
   {
     vector<int64_t> p1OutShape = {batchSize, p1Channels, nnYLen, nnXLen};
-    vector<int64_t> biasShape = {batchSize, p1Channels};
+    vector<int64_t> biasShape = {batchSize, p1Channels, 1, 1};  // Broadcast to NCHW
 
     aclTensor* p1OutTensor = createAclTensor(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
-    aclTensor* biasTensor = createAclTensor(g1BiasBuf, biasShape, dtype, ACL_FORMAT_ND);
+    aclTensor* biasTensor = createAclTensor(g1BiasBuf, biasShape, dtype, ACL_FORMAT_NCHW);
     aclTensor* resultTensor = createAclTensor(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
     aclScalar* alpha = createFloatScalar(1.0f);
 
@@ -2020,12 +1998,6 @@ void Model::applyValueHead(
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
-  cout << "Ascend: applyValueHead batchSize=" << batchSize
-       << " v1Channels=" << v1Conv->outChannels
-       << " v2Channels=" << v2Mul->outChannels
-       << " ownershipChannels=" << vOwnershipConv->outChannels
-       << " useFP16=" << useFP16
-       << endl;
   (void)scratchBuf;  // Not currently used, but kept for API compatibility
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   int v1Channels = v1Conv->outChannels;
@@ -2255,12 +2227,6 @@ void NeuralNet::getOutput(
   const int nnXLen = gpuHandle->nnXLen;
   const int nnYLen = gpuHandle->nnYLen;
   const int modelVersion = gpuHandle->model->modelVersion;
-
-  cout << "Ascend: getOutput batchSize=" << batchSize
-       << " nnXLen=" << nnXLen << " nnYLen=" << nnYLen
-       << " useFP16=" << gpuHandle->usingFP16
-       << " modelVersion=" << modelVersion
-       << endl;
 
   const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
   const int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(modelVersion);
