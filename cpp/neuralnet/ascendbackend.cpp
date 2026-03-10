@@ -716,6 +716,13 @@ struct Buffers {
   void* v2OutBuf;           // Value head v2 output
   void* ownershipScratchBuf; // Ownership scratch buffer
 
+  // FP16 scratch buffers for output conversion (only used in FP16 mode)
+  // These hold FP16 outputs before conversion to FP32 final buffers
+  void* valueScratchBuf;       // FP16 value output before conversion
+  void* scoreValueScratchBuf;  // FP16 scoreValue output before conversion
+  void* policyScratchBuf;      // FP16 policy output before conversion
+  void* policyPassScratchBuf;  // FP16 policyPass output before conversion
+
   // Size tracking
   size_t inputBufBytes;
   size_t inputGlobalBufBytes;
@@ -759,7 +766,11 @@ struct Buffers {
       v1Out2Buf(nullptr),
       v1MeanBuf(nullptr),
       v2OutBuf(nullptr),
-      ownershipScratchBuf(nullptr)
+      ownershipScratchBuf(nullptr),
+      valueScratchBuf(nullptr),
+      scoreValueScratchBuf(nullptr),
+      policyScratchBuf(nullptr),
+      policyPassScratchBuf(nullptr)
   {
     size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
 
@@ -830,6 +841,20 @@ struct Buffers {
     v2OutBuf = ascendMalloc((size_t)v2Channels * maxBatchSize * sizeof(float));
     ownershipScratchBuf = ascendMalloc((size_t)ownershipChannels * maxBatchSize * nnXLen * nnYLen * eltSize);
 
+    // FP16 output scratch buffers (for FP16->FP32 conversion)
+    // These are only needed in FP16 mode to hold FP16 outputs before conversion
+    if(useFP16) {
+      valueScratchBuf = ascendMalloc(valueBufBytes / 2);  // FP16 is half size
+      scoreValueScratchBuf = ascendMalloc(scoreValueBufBytes / 2);
+      policyScratchBuf = ascendMalloc(policyBufBytes / 2);
+      policyPassScratchBuf = ascendMalloc(policyPassBufBytes / 2);
+    } else {
+      valueScratchBuf = nullptr;
+      scoreValueScratchBuf = nullptr;
+      policyScratchBuf = nullptr;
+      policyPassScratchBuf = nullptr;
+    }
+
     // Allocate workspace
     workspaceBytes = extraWorkspace;
     if(workspaceBytes > 0) {
@@ -865,6 +890,11 @@ struct Buffers {
     ascendFree(v1MeanBuf);
     ascendFree(v2OutBuf);
     ascendFree(ownershipScratchBuf);
+    // Free FP16 scratch buffers
+    ascendFree(valueScratchBuf);
+    ascendFree(scoreValueScratchBuf);
+    ascendFree(policyScratchBuf);
+    ascendFree(policyPassScratchBuf);
   }
 
   Buffers() = delete;
@@ -2050,6 +2080,8 @@ void Model::applyPolicyHead(
   void* g1ConcatBuf = buffers->g1ConcatBuf;
   void* g1BiasBuf = buffers->g1BiasBuf;
   void* p1PassBuf = buffers->p1PassBuf;
+  void* policyScratchBuf = buffers->policyScratchBuf;
+  void* policyPassScratchBuf = buffers->policyPassScratchBuf;
 
   // Step 1: Apply p1Conv: trunk -> p1Out
   p1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
@@ -2095,18 +2127,52 @@ void Model::applyPolicyHead(
   p1BN->apply(handle, stream, batchSize, p1OutBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
 
   // Step 8: Apply p2Conv: scratchBuf -> policyBuf
-  p2Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, scratchBuf, policyBuf, workspaceBuf, workspaceBytes);
+  // In FP16 mode, output to scratch buffer first, then convert to FP32
+  if(useFP16) {
+    p2Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, scratchBuf, policyScratchBuf, workspaceBuf, workspaceBytes);
+    // Convert FP16 to FP32 for final output
+    aclTensor* srcTensor = handle->tensorCache.get(policyScratchBuf, {batchSize, numPolicyChannels, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
+    aclTensor* dstTensor = handle->tensorCache.get(policyBuf, {batchSize, numPolicyChannels, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    uint64_t castWsSize = 0;
+    aclOpExecutor* castExecutor = nullptr;
+    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
+    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+      aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+    }
+  } else {
+    p2Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, scratchBuf, policyBuf, workspaceBuf, workspaceBytes);
+  }
 
   // Step 9: Compute policy pass logit
   // gpoolToPassMul: g1Concat -> p1PassBuf
   // gpoolToPassBias: p1PassBuf (in-place)
   // gpoolToPassMul2: p1PassBuf -> policyPassBuf (if modelVersion >= 15)
-  if(modelVersion >= 15) {
-    gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-    gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-    gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
+  // In FP16 mode, output to scratch buffer first, then convert to FP32
+  if(useFP16) {
+    if(modelVersion >= 15) {
+      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+      gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+      gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassScratchBuf, workspaceBuf, workspaceBytes);
+    } else {
+      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassScratchBuf, workspaceBuf, workspaceBytes);
+    }
+    // Convert FP16 to FP32 for final output
+    aclTensor* srcTensor = handle->tensorCache.get(policyPassScratchBuf, {batchSize, numPolicyChannels}, ACL_FLOAT16, ACL_FORMAT_ND);
+    aclTensor* dstTensor = handle->tensorCache.get(policyPassBuf, {batchSize, numPolicyChannels}, ACL_FLOAT, ACL_FORMAT_ND);
+    uint64_t castWsSize = 0;
+    aclOpExecutor* castExecutor = nullptr;
+    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
+    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+      aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+    }
   } else {
-    gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
+    if(modelVersion >= 15) {
+      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+      gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+      gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
+    } else {
+      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
+    }
   }
 
   (void)dtype;
@@ -2137,6 +2203,8 @@ void Model::applyValueHead(
   void* v1MeanBuf = buffers->v1MeanBuf;
   void* v2OutBuf = buffers->v2OutBuf;
   void* ownershipScratchBuf = buffers->ownershipScratchBuf;
+  void* valueScratchBuf = buffers->valueScratchBuf;
+  void* scoreValueScratchBuf = buffers->scoreValueScratchBuf;
 
   // Step 1: Apply v1Conv: trunk -> v1Out
   v1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), v1OutBuf, workspaceBuf, workspaceBytes);
@@ -2175,17 +2243,47 @@ void Model::applyValueHead(
   // Step 5: Apply v2Bias: v2Out -> v2Out (in-place)
   v2Bias->apply(handle, stream, batchSize, v2OutBuf, v2OutBuf, workspaceBuf, workspaceBytes);
 
-  // Step 6: Apply v3Mul: v2Out -> valueBuf
-  v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
+  // Step 6-7: Apply v3Mul + v3Bias: v2Out -> valueBuf
+  // In FP16 mode, output to scratch buffer first, then convert to FP32
+  if(useFP16) {
+    v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueScratchBuf, workspaceBuf, workspaceBytes);
+    v3Bias->apply(handle, stream, batchSize, valueScratchBuf, valueScratchBuf, workspaceBuf, workspaceBytes);
+    // Convert FP16 to FP32 for final output
+    {
+      aclTensor* srcTensor = handle->tensorCache.get(valueScratchBuf, {batchSize, numValueChannels}, ACL_FLOAT16, ACL_FORMAT_ND);
+      aclTensor* dstTensor = handle->tensorCache.get(valueBuf, {batchSize, numValueChannels}, ACL_FLOAT, ACL_FORMAT_ND);
+      uint64_t castWsSize = 0;
+      aclOpExecutor* castExecutor = nullptr;
+      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
+      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+        aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+      }
+    }
+  } else {
+    v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
+    v3Bias->apply(handle, stream, batchSize, valueBuf, valueBuf, workspaceBuf, workspaceBytes);
+  }
 
-  // Step 7: Apply v3Bias: valueBuf -> valueBuf (in-place)
-  v3Bias->apply(handle, stream, batchSize, valueBuf, valueBuf, workspaceBuf, workspaceBytes);
-
-  // Step 8: Apply sv3Mul: v2Out -> scoreValueBuf
-  sv3Mul->apply(handle, stream, batchSize, v2OutBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
-
-  // Step 9: Apply sv3Bias: scoreValueBuf -> scoreValueBuf (in-place)
-  sv3Bias->apply(handle, stream, batchSize, scoreValueBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
+  // Step 8-9: Apply sv3Mul + sv3Bias: v2Out -> scoreValueBuf
+  // In FP16 mode, output to scratch buffer first, then convert to FP32
+  if(useFP16) {
+    sv3Mul->apply(handle, stream, batchSize, v2OutBuf, scoreValueScratchBuf, workspaceBuf, workspaceBytes);
+    sv3Bias->apply(handle, stream, batchSize, scoreValueScratchBuf, scoreValueScratchBuf, workspaceBuf, workspaceBytes);
+    // Convert FP16 to FP32 for final output
+    {
+      aclTensor* srcTensor = handle->tensorCache.get(scoreValueScratchBuf, {batchSize, numScoreValueChannels}, ACL_FLOAT16, ACL_FORMAT_ND);
+      aclTensor* dstTensor = handle->tensorCache.get(scoreValueBuf, {batchSize, numScoreValueChannels}, ACL_FLOAT, ACL_FORMAT_ND);
+      uint64_t castWsSize = 0;
+      aclOpExecutor* castExecutor = nullptr;
+      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
+      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+        aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+      }
+    }
+  } else {
+    sv3Mul->apply(handle, stream, batchSize, v2OutBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
+    sv3Bias->apply(handle, stream, batchSize, scoreValueBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
+  }
 
   // Step 10: Apply vOwnershipConv: v1Out2 -> ownershipBuf
   // If using FP16, output to ownershipScratchBuf first, then convert to FP32
