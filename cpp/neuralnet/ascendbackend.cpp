@@ -2128,8 +2128,8 @@ void Model::applyPolicyHead(
     aclIntArray* outputSize = createAclIntArray({1, 1});
 
     // Use scratchBuf for intermediate pooling results
-    // In FP16 mode: [meanFP16][meanFP32][scaledMeanFP32][maxFP32]
-    // In FP32 mode: [meanFP32][scaledMeanFP32][maxFP32] (no separate cast buffer needed)
+    // In FP16 mode: [meanFP16][meanFP32][maxFP16][maxFP32][scaledMeanFP32]
+    // In FP32 mode: [meanFP32][maxFP32][scaledMeanFP32] (no separate cast buffers needed)
     size_t poolElts = (size_t)batchSize * g1Channels;  // Elements for [batch, channels, 1, 1]
     size_t poolBytesFP32 = poolElts * sizeof(float);
     size_t poolBytesDtype = useFP16 ? (poolElts * sizeof(aclFloat16)) : poolBytesFP32;
@@ -2155,9 +2155,10 @@ void Model::applyPolicyHead(
     }
 
     // 4b: Max pooling using aclnnAdaptiveMaxPool2d
-    // Output max after meanFP32Buf
-    void* maxPoolBuf = (char*)meanFP32Buf + poolBytesFP32;  // [batch, g1Channels, 1, 1] in FP32
-    aclTensor* maxPoolTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    // Output max after meanFP32Buf, using dtype (same as input for dtype matching)
+    void* maxPoolBuf = (char*)meanFP32Buf + poolBytesFP32;  // [batch, g1Channels, 1, 1] in dtype
+    void* maxFP32Buf = (char*)maxPoolBuf + poolBytesDtype;  // [batch, g1Channels, 1, 1] in FP32 (for concat)
+    aclTensor* maxPoolTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
     aclTensor* maxIndicesTensor = handle->tensorCache.get(maxIndicesBuf, {batchSize, g1Channels, 1, 1}, ACL_INT64, ACL_FORMAT_NCHW);
 
     uint64_t maxWsSize = 0;
@@ -2171,7 +2172,29 @@ void Model::applyPolicyHead(
       throw StringError("aclnnAdaptiveMaxPool2d failed for policy head max pooling: " + to_string(status));
     }
 
-    // 4c: Cast mean to FP32 if needed (for scaledMean computation and concatenation)
+    // 4c: Cast max to FP32 if needed (for concatenation)
+    // In FP32 mode, maxPoolBuf == maxFP32Buf so we can skip the cast
+    aclTensor* maxFP32Tensor;
+    if(useFP16) {
+      aclTensor* srcTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
+      maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      uint64_t castWsSize = 0;
+      aclOpExecutor* castExecutor = nullptr;
+      status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, maxFP32Tensor, &castWsSize, &castExecutor);
+      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+        status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+      }
+      if(status != ACLNN_SUCCESS) {
+        aclDestroyIntArray(outputSize);
+        throw StringError("aclnnCast failed for policy head max pooling: " + to_string(status));
+      }
+    } else {
+      // In FP32 mode, maxPoolBuf is already FP32
+      maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      maxFP32Buf = maxPoolBuf;
+    }
+
+    // 4d: Cast mean to FP32 if needed (for scaledMean computation and concatenation)
     // In FP32 mode, meanPoolBuf == meanFP32Buf so we can skip the cast
     aclTensor* meanFP32Tensor;
     if(useFP16) {
@@ -2194,12 +2217,12 @@ void Model::applyPolicyHead(
       meanFP32Buf = meanPoolBuf;
     }
 
-    // 4d: Compute scaledMean = mean * (sqrt(area) - 14) * 0.1
+    // 4e: Compute scaledMean = mean * (sqrt(area) - 14) * 0.1
     float sqrtArea = sqrtf((float)(nnXLen * nnYLen));
     float scale = (sqrtArea - 14.0f) * 0.1f;
 
-    // scaledMean output after maxPoolBuf
-    void* scaledMeanBuf = (char*)maxPoolBuf + poolBytesFP32;  // [batch, g1Channels, 1, 1] in FP32
+    // scaledMean output after maxFP32Buf
+    void* scaledMeanBuf = (char*)maxFP32Buf + poolBytesFP32;  // [batch, g1Channels, 1, 1] in FP32
     aclTensor* scaledMeanTensor = handle->tensorCache.get(scaledMeanBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
 
     {
@@ -2217,13 +2240,13 @@ void Model::applyPolicyHead(
       }
     }
 
-    // 4e: Concatenate [mean, scaledMean, max] along channel dimension
+    // 4f: Concatenate [mean, scaledMean, max] along channel dimension
     // Reshape each [batch, channels, 1, 1] to [batch, channels] for concatenation
     // Then concatenate along dim=1 to get [batch, channels*3]
 
     aclTensor* mean2D = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
     aclTensor* scaledMean2D = handle->tensorCache.get(scaledMeanBuf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
-    aclTensor* max2D = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclTensor* max2D = handle->tensorCache.get(maxFP32Buf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
 
     // Create tensor array for concatenation: [mean, scaledMean, max]
     aclTensor* tensorsForCat[3] = {mean2D, scaledMean2D, max2D};
