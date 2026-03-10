@@ -20,7 +20,7 @@
 #include "aclnn_cat.h"
 #include "aclnn_batch_norm.h"
 #include "aclnn_mish.h"
-#include "aclnn_muls.h"
+#include "aclnnop/aclnn_mul.h"
 #include "aclnn_softplus.h"
 #include "aclnn_tanh.h"
 
