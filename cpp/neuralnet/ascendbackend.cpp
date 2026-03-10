@@ -20,6 +20,7 @@
 #include "aclnn_cat.h"
 #include "aclnn_batch_norm.h"
 #include "aclnn_mish.h"
+#include "aclnn_muls.h"
 #include "aclnn_softplus.h"
 #include "aclnn_tanh.h"
 
@@ -708,12 +709,14 @@ struct Buffers {
   void* p1OutBuf;           // Policy head intermediate
   void* g1OutBuf;           // Policy head gpool intermediate
   void* g1Out2Buf;          // Policy head gpool intermediate 2
-  void* g1ConcatBuf;        // Policy head gpool concat
+  void* g1ConcatBuf;        // Policy head gpool concat (always FP32)
+  void* g1ConcatFP16Buf;    // Policy head gpool concat FP16 version (for MatMulLayer in FP16 mode)
   void* g1BiasBuf;          // Policy head bias
   void* p1PassBuf;          // Policy pass intermediate
   void* v1OutBuf;           // Value head intermediate
   void* v1Out2Buf;          // Value head intermediate 2
-  void* v1MeanBuf;          // Value head mean buffer
+  void* v1MeanBuf;          // Value head mean buffer (always FP32)
+  void* v1MeanFP16Buf;      // Value head mean buffer FP16 version (for MatMulLayer in FP16 mode)
   void* v2OutBuf;           // Value head v2 output
   void* ownershipScratchBuf; // Ownership scratch buffer
 
@@ -762,11 +765,13 @@ struct Buffers {
       g1OutBuf(nullptr),
       g1Out2Buf(nullptr),
       g1ConcatBuf(nullptr),
+      g1ConcatFP16Buf(nullptr),
       g1BiasBuf(nullptr),
       p1PassBuf(nullptr),
       v1OutBuf(nullptr),
       v1Out2Buf(nullptr),
       v1MeanBuf(nullptr),
+      v1MeanFP16Buf(nullptr),
       v2OutBuf(nullptr),
       ownershipScratchBuf(nullptr),
       valueScratchBuf(nullptr),
@@ -857,15 +862,25 @@ struct Buffers {
       policyPassScratchBuf = nullptr;
     }
 
+    // FP16 intermediate buffers for global pooling results (needed for MatMulLayer in FP16 mode)
+    // Global pooling always outputs FP32, but MatMulLayer expects FP16 inputs when useFP16=true
+    if(useFP16) {
+      g1ConcatFP16Buf = ascendMalloc((size_t)g1Channels * 3 * maxBatchSize * sizeof(aclFloat16));
+      v1MeanFP16Buf = ascendMalloc((size_t)v1Channels * 3 * maxBatchSize * sizeof(aclFloat16));
+    } else {
+      g1ConcatFP16Buf = nullptr;
+      v1MeanFP16Buf = nullptr;
+    }
+
     // Allocate maxIndices buffer for global pooling (int64 for indices from max pooling)
     // Size: [max(g1Channels, valueHead.v1Conv.outChannels)] * batchSize
     size_t maxIndicesSize = (size_t)max(g1Channels, m.valueHead.v1Conv.outChannels) * maxBatchSize;
     maxIndicesBuf = ascendMalloc(maxIndicesSize * sizeof(int64_t));
 
     // Allocate workspace
-    workspaceBytes = extraWorkspace
+    workspaceBytes = extraWorkspace;
     if(workspaceBytes > 0) {
-      workspaceBuf = ascendMalloc(workspaceBytes)
+      workspaceBuf = ascendMalloc(workspaceBytes);
     }
   }
 
@@ -902,6 +917,9 @@ struct Buffers {
     ascendFree(scoreValueScratchBuf);
     ascendFree(policyScratchBuf);
     ascendFree(policyPassScratchBuf);
+    // Free FP16 global pooling intermediate buffers
+    ascendFree(g1ConcatFP16Buf);
+    ascendFree(v1MeanFP16Buf);
     // Free maxIndices buffer
     ascendFree(maxIndicesBuf);
   }
@@ -2102,17 +2120,28 @@ void Model::applyPolicyHead(
   g1BN->apply(handle, stream, batchSize, g1OutBuf, maskBuf, g1Out2Buf, workspaceBuf, workspaceBytes);
 
   // Step 4: Global pooling on g1Out2 -> g1Concat
-  // This computes: mean, max, mean * (sqrt(area) - 14) * 0.1 and concatenates them
-  // Output format: [mean, max, scaledMean] -> [batch, g1Channels * 3]
+  // This computes: mean, scaledMean, max and concatenates them
+  // Output format per CUDA: [mean, scaledMean, max] -> [batch, g1Channels * 3]
+  // where scaledMean = mean * (sqrt(area) - 14) * 0.1
   {
     void* maxIndicesBuf = buffers->maxIndicesBuf;
-    aclIntArray* outputSize = aclCreateIntArray({1, 1});
+    aclIntArray* outputSize = createAclIntArray({1, 1});
+
+    // Use scratchBuf for intermediate pooling results
+    // In FP16 mode: [meanFP16][meanFP32][scaledMeanFP32][maxFP32]
+    // In FP32 mode: [meanFP32][scaledMeanFP32][maxFP32] (no separate cast buffer needed)
+    size_t poolElts = (size_t)batchSize * g1Channels;  // Elements for [batch, channels, 1, 1]
+    size_t poolBytesFP32 = poolElts * sizeof(float);
+    size_t poolBytesDtype = useFP16 ? (poolElts * sizeof(aclFloat16)) : poolBytesFP32;
+
+    // Mean pool: output to first part of scratchBuf (FP16/FP32 matching input)
+    void* meanPoolBuf = scratchBuf;  // [batch, g1Channels, 1, 1] in input dtype
+    // FP32 mean buffer (for concatenation): comes after meanPoolBuf
+    void* meanFP32Buf = (char*)scratchBuf + poolBytesDtype;  // [batch, g1Channels, 1, 1] in FP32
 
     // 4a: Mean pooling using aclnnAdaptiveAvgPool2d
-    // Input: g1Out2Buf [batch, g1Channels, nnYLen, nnXLen]
-    // Output: meanPool [batch, g1Channels, 1, 1]
     aclTensor* g1Out2Tensor = handle->tensorCache.get(g1Out2Buf, {batchSize, g1Channels, nnYLen, nnXLen}, dtype, ACL_FORMAT_NCHW);
-    aclTensor* meanPoolTensor = handle->tensorCache.get(g1ConcatBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    aclTensor* meanPoolTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
 
     uint64_t meanWsSize = 0;
     aclOpExecutor* meanExecutor = nullptr;
@@ -2126,8 +2155,9 @@ void Model::applyPolicyHead(
     }
 
     // 4b: Max pooling using aclnnAdaptiveMaxPool2d
-    // Output: maxPool [batch, g1Channels, 1, 1], indices [batch, g1Channels, 1, 1] (int64)
-    aclTensor* maxPoolTensor = handle->tensorCache.get(scratchBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    // Output max after meanFP32Buf
+    void* maxPoolBuf = (char*)meanFP32Buf + poolBytesFP32;  // [batch, g1Channels, 1, 1] in FP32
+    aclTensor* maxPoolTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
     aclTensor* maxIndicesTensor = handle->tensorCache.get(maxIndicesBuf, {batchSize, g1Channels, 1, 1}, ACL_INT64, ACL_FORMAT_NCHW);
 
     uint64_t maxWsSize = 0;
@@ -2141,56 +2171,108 @@ void Model::applyPolicyHead(
       throw StringError("aclnnAdaptiveMaxPool2d failed for policy head max pooling: " + to_string(status));
     }
 
-    // 4c: Compute scaledMean = mean * (sqrt(area) - 14) * 0.1
+    // 4c: Cast mean to FP32 if needed (for scaledMean computation and concatenation)
+    // In FP32 mode, meanPoolBuf == meanFP32Buf so we can skip the cast
+    aclTensor* meanFP32Tensor;
+    if(useFP16) {
+      aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
+      meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      uint64_t castWsSize = 0;
+      aclOpExecutor* castExecutor = nullptr;
+      status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
+      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+        aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+      }
+      if(status != ACLNN_SUCCESS) {
+        aclDestroyIntArray(outputSize);
+        throw StringError("aclnnCast failed for policy head mean pooling: " + to_string(status));
+      }
+    } else {
+      // In FP32 mode, meanPoolBuf is already FP32
+      meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      // meanFP32Buf points to same location as meanPoolBuf
+      meanFP32Buf = meanPoolBuf;
+    }
+
+    // 4d: Compute scaledMean = mean * (sqrt(area) - 14) * 0.1
     float sqrtArea = sqrtf((float)(nnXLen * nnYLen));
     float scale = (sqrtArea - 14.0f) * 0.1f;
 
-    // Create scaledMean tensor (reuse part of g1ConcatBuf at offset g1Channels*2)
-    void* scaledMeanBuf = (char*)g1ConcatBuf + (size_t)g1Channels * 2 * batchSize * sizeof(float);
+    // scaledMean output after maxPoolBuf
+    void* scaledMeanBuf = (char*)maxPoolBuf + poolBytesFP32;  // [batch, g1Channels, 1, 1] in FP32
     aclTensor* scaledMeanTensor = handle->tensorCache.get(scaledMeanBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
 
-    // Multiply mean by scale
-    uint64_t mulWsSize = 0;
-    aclOpExecutor* mulExecutor = nullptr;
-    aclScalar* scaleScalar = handle->alphaOneScalar; // We need a proper scalar here
-    // Note: aclnnMuls would be better but we use aclnnMul with broadcast
-    // For simplicity, zero the scaledMean for now and just copy mean
-    // TODO: Implement proper scalar multiplication
-
-    // 4d: Concatenate [mean, max, scaledMean] -> g1ConcatBuf [batch, g1Channels * 3]
-    // The tensors are already at the right positions in g1ConcatBuf:
-    // - meanPoolTensor at offset 0
-    // - maxPoolTensor needs to be copied to offset g1Channels
-    // - scaledMeanTensor at offset g1Channels * 2
-
-    // Copy maxPool to g1ConcatBuf + g1Channels offset
-    void* maxDstBuf = (char*)g1ConcatBuf + (size_t)g1Channels * batchSize * sizeof(float);
-    aclTensor* maxDstTensor = handle->tensorCache.get(maxDstBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
-
-    uint64_t copyWsSize = 0;
-    aclOpExecutor* copyExecutor = nullptr;
-    status = aclnnInplaceCopyGetWorkspaceSize(maxDstTensor, maxPoolTensor, &copyWsSize, &copyExecutor);
-    if(status == ACLNN_SUCCESS && copyWsSize <= workspaceBytes) {
-      status = aclnnInplaceCopy(workspaceBuf, copyWsSize, copyExecutor, stream);
-    }
-
-    // For scaledMean, copy meanPool for now (simplified implementation)
-    // TODO: Implement proper mean * scale computation
     {
-      uint64_t copyWsSize2 = 0;
-      aclOpExecutor* copyExecutor2 = nullptr;
-      status = aclnnInplaceCopyGetWorkspaceSize(scaledMeanTensor, meanPoolTensor, &copyWsSize2, &copyExecutor2);
-      if(status == ACLNN_SUCCESS && copyWsSize2 <= workspaceBytes) {
-        aclnnInplaceCopy(workspaceBuf, copyWsSize2, copyExecutor2, stream);
+      aclScalar* scaleScalar = aclCreateScalar(&scale, ACL_FLOAT);
+      uint64_t mulsWsSize = 0;
+      aclOpExecutor* mulsExecutor = nullptr;
+      status = aclnnMulsGetWorkspaceSize(meanFP32Tensor, scaleScalar, scaledMeanTensor, &mulsWsSize, &mulsExecutor);
+      if(status == ACLNN_SUCCESS && mulsWsSize <= workspaceBytes) {
+        status = aclnnMuls(workspaceBuf, mulsWsSize, mulsExecutor, stream);
+      }
+      aclDestroyScalar(scaleScalar);
+      if(status != ACLNN_SUCCESS) {
+        aclDestroyIntArray(outputSize);
+        throw StringError("aclnnMuls failed for policy head scaledMean: " + to_string(status));
       }
     }
 
+    // 4e: Concatenate [mean, scaledMean, max] along channel dimension
+    // Reshape each [batch, channels, 1, 1] to [batch, channels] for concatenation
+    // Then concatenate along dim=1 to get [batch, channels*3]
+
+    aclTensor* mean2D = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclTensor* scaledMean2D = handle->tensorCache.get(scaledMeanBuf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclTensor* max2D = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
+
+    // Create tensor array for concatenation: [mean, scaledMean, max]
+    aclTensor* tensorsForCat[3] = {mean2D, scaledMean2D, max2D};
+    aclTensorList* tensorList = aclCreateTensorList(tensorsForCat, 3);
+    if(!tensorList) {
+      aclDestroyIntArray(outputSize);
+      throw StringError("aclCreateTensorList failed for policy head global pooling concat");
+    }
+
+    // Output tensor for concat: [batch, g1Channels * 3]
+    aclTensor* concatOut = handle->tensorCache.get(g1ConcatBuf, {batchSize, g1Channels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
+
+    uint64_t catWsSize = 0;
+    aclOpExecutor* catExecutor = nullptr;
+    status = aclnnCatGetWorkspaceSize(tensorList, 1, concatOut, &catWsSize, &catExecutor);  // dim=1 (channel dim)
+    if(status == ACLNN_SUCCESS && catWsSize <= workspaceBytes) {
+      status = aclnnCat(workspaceBuf, catWsSize, catExecutor, stream);
+    }
+    aclDestroyTensorList(tensorList);
+    if(status != ACLNN_SUCCESS) {
+      aclDestroyIntArray(outputSize);
+      throw StringError("aclnnCat failed for policy head global pooling concat: " + to_string(status));
+    }
+
     aclDestroyIntArray(outputSize);
-    (void)scale; // Suppress unused warning for now
   }
 
   // Step 5: Apply gpoolToBiasMul: g1Concat -> g1Bias
-  gpoolToBiasMul->apply(handle, stream, batchSize, g1ConcatBuf, g1BiasBuf, workspaceBuf, workspaceBytes);
+  // CRITICAL: In FP16 mode, g1ConcatBuf contains FP32 data from global pooling.
+  // MatMulLayer expects FP16 input, so we must convert FP32->FP16 first.
+  void* g1ConcatInputBuf;  // Buffer to pass to MatMulLayer
+  if(useFP16) {
+    // Cast g1ConcatBuf (FP32) -> g1ConcatFP16Buf (FP16)
+    aclTensor* srcTensor = handle->tensorCache.get(g1ConcatBuf, {batchSize, g1Channels*3}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclTensor* dstTensor = handle->tensorCache.get(buffers->g1ConcatFP16Buf, {batchSize, g1Channels*3}, ACL_FLOAT16, ACL_FORMAT_ND);
+    uint64_t castWsSize = 0;
+    aclOpExecutor* castExecutor = nullptr;
+    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT16, dstTensor, &castWsSize, &castExecutor);
+    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+      status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+    }
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnCast failed for policy head g1Concat FP32->FP16: " + to_string(status));
+    }
+    g1ConcatInputBuf = buffers->g1ConcatFP16Buf;
+  } else {
+    g1ConcatInputBuf = g1ConcatBuf;
+  }
+  gpoolToBiasMul->apply(handle, stream, batchSize, g1ConcatInputBuf, g1BiasBuf, workspaceBuf, workspaceBytes);
 
   // Step 6: Add g1Bias to p1Out (broadcast across spatial dims)
   // g1Bias is (batch, p1Channels, 1, 1), p1Out is (batch, p1Channels, nnYLen, nnXLen)
@@ -2238,14 +2320,15 @@ void Model::applyPolicyHead(
   // gpoolToPassMul: g1Concat -> p1PassBuf
   // gpoolToPassBias: p1PassBuf (in-place)
   // gpoolToPassMul2: p1PassBuf -> policyPassBuf (if modelVersion >= 15)
-  // In FP16 mode, output to scratch buffer first, then convert to FP32
+  // CRITICAL: Use FP16 buffer when in FP16 mode (same as Step 5)
+  void* g1ConcatPassBuf = useFP16 ? buffers->g1ConcatFP16Buf : g1ConcatBuf;
   if(useFP16) {
     if(modelVersion >= 15) {
-      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatPassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
       gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
       gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassScratchBuf, workspaceBuf, workspaceBytes);
     } else {
-      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassScratchBuf, workspaceBuf, workspaceBytes);
+      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatPassBuf, policyPassScratchBuf, workspaceBuf, workspaceBytes);
     }
     // Convert FP16 to FP32 for final output
     aclTensor* srcTensor = handle->tensorCache.get(policyPassScratchBuf, {batchSize, numPolicyChannels}, ACL_FLOAT16, ACL_FORMAT_ND);
@@ -2258,11 +2341,11 @@ void Model::applyPolicyHead(
     }
   } else {
     if(modelVersion >= 15) {
-      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatPassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
       gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
       gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
     } else {
-      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
+      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatPassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
     }
   }
 
@@ -2302,19 +2385,28 @@ void Model::applyValueHead(
   // Step 2: Apply v1BN: v1Out -> v1Out2
   v1BN->apply(handle, stream, batchSize, v1OutBuf, maskBuf, v1Out2Buf, workspaceBuf, workspaceBytes);
 
-  // Step 3: Global pooling on v1Out2 -> v1Mean
-  // This computes: mean, max, mean * (sqrt(area) - 14) * 0.1 and concatenates them
-  // Output format: [mean, max, scaledMean] -> [batch, v1Channels * 3]
+  // Step 3: Value head global pooling on v1Out2 -> v1Mean
+  // CRITICAL: Value head uses DIFFERENT pooling than policy head!
+  // Value head output format per CUDA valueHeadPoolChannelsNCHWKernel:
+  //   [mean, scaledMean1, scaledMean2] -> [batch, v1Channels * 3]
+  //   scaledMean1 = mean * (sqrt(area) - 14) * 0.1
+  //   scaledMean2 = mean * ((sqrt(area) - 14)^2 * 0.01 - 0.1)
+  // Note: NO max pooling for value head!
   {
-    void* maxIndicesBuf = buffers->maxIndicesBuf;
-    aclIntArray* outputSize = aclCreateIntArray({1, 1});
+    aclIntArray* outputSize = createAclIntArray({1, 1});
+
+    // Use scratchBuf for intermediate pooling results
+    // Layout: [meanFP16/FP32][meanFP32][scaledMean1Buf][scaledMean2Buf]
+    size_t poolElts = (size_t)batchSize * v1Channels;
+    size_t poolBytesFP32 = poolElts * sizeof(float);
+    size_t poolBytesDtype = useFP16 ? (poolElts * sizeof(aclFloat16)) : poolBytesFP32;
+
+    void* meanPoolBuf = scratchBuf;  // [batch, v1Channels, 1, 1] in input dtype
+    void* meanFP32Buf = (char*)scratchBuf + poolBytesDtype;  // [batch, v1Channels, 1, 1] in FP32
 
     // 3a: Mean pooling using aclnnAdaptiveAvgPool2d
-    // Input: v1Out2Buf [batch, v1Channels, nnYLen, nnXLen]
-    // Output: meanPool [batch, v1Channels, 1, 1]
     aclTensor* v1Out2Tensor = handle->tensorCache.get(v1Out2Buf, {batchSize, v1Channels, nnYLen, nnXLen}, dtype, ACL_FORMAT_NCHW);
-    aclTensor* meanPoolTensor = handle->tensorCache.get(v1MeanBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
-
+    aclTensor* meanPoolTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
     uint64_t meanWsSize = 0;
     aclOpExecutor* meanExecutor = nullptr;
     aclnnStatus status = aclnnAdaptiveAvgPool2dGetWorkspaceSize(v1Out2Tensor, outputSize, meanPoolTensor, &meanWsSize, &meanExecutor);
@@ -2326,54 +2418,117 @@ void Model::applyValueHead(
       throw StringError("aclnnAdaptiveAvgPool2d failed for value head mean pooling: " + to_string(status));
     }
 
-    // 3b: Max pooling using aclnnAdaptiveMaxPool2d
-    // Output: maxPool [batch, v1Channels, 1, 1], indices [batch, v1Channels, 1, 1] (int64)
-    aclTensor* maxPoolTensor = handle->tensorCache.get(scratchBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
-    aclTensor* maxIndicesTensor = handle->tensorCache.get(maxIndicesBuf, {batchSize, v1Channels, 1, 1}, ACL_INT64, ACL_FORMAT_NCHW);
-
-    uint64_t maxWsSize = 0;
-    aclOpExecutor* maxExecutor = nullptr;
-    status = aclnnAdaptiveMaxPool2dGetWorkspaceSize(v1Out2Tensor, outputSize, maxPoolTensor, maxIndicesTensor, &maxWsSize, &maxExecutor);
-    if(status == ACLNN_SUCCESS && maxWsSize <= workspaceBytes) {
-      status = aclnnAdaptiveMaxPool2d(workspaceBuf, maxWsSize, maxExecutor, stream);
+    // 3b: Cast mean to FP32 if needed
+    aclTensor* meanFP32Tensor;
+    if(useFP16) {
+      aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_NCHW);
+      meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      uint64_t castWsSize = 0;
+      aclOpExecutor* castExecutor = nullptr;
+      status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
+      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+        aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+      }
+      if(status != ACLNN_SUCCESS) {
+        aclDestroyIntArray(outputSize);
+        throw StringError("aclnnCast failed for value head mean pooling: " + to_string(status));
+      }
+    } else {
+      meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      meanFP32Buf = meanPoolBuf;
     }
+
+    // 3c: Compute scaledMean1 = mean * (sqrt(area) - 14) * 0.1
+    float sqrtArea = sqrtf((float)(nnXLen * nnYLen));
+    float scale1 = (sqrtArea - 14.0f) * 0.1f;
+
+    void* scaledMean1Buf = (char*)meanFP32Buf + poolBytesFP32;
+    aclTensor* scaledMean1Tensor = handle->tensorCache.get(scaledMean1Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    {
+      aclScalar* scaleScalar = aclCreateScalar(&scale1, ACL_FLOAT);
+      uint64_t mulsWsSize = 0;
+      aclOpExecutor* mulsExecutor = nullptr;
+      status = aclnnMulsGetWorkspaceSize(meanFP32Tensor, scaleScalar, scaledMean1Tensor, &mulsWsSize, &mulsExecutor);
+      if(status == ACLNN_SUCCESS && mulsWsSize <= workspaceBytes) {
+        status = aclnnMuls(workspaceBuf, mulsWsSize, mulsExecutor, stream);
+      }
+      aclDestroyScalar(scaleScalar);
+      if(status != ACLNN_SUCCESS) {
+        aclDestroyIntArray(outputSize);
+        throw StringError("aclnnMuls failed for value head scaledMean1: " + to_string(status));
+      }
+    }
+
+    // 3d: Compute scaledMean2 = mean * ((sqrt(area) - 14)^2 * 0.01 - 0.1)
+    float scale2 = (sqrtArea - 14.0f) * (sqrtArea - 14.0f) * 0.01f - 0.1f;
+
+    void* scaledMean2Buf = (char*)scaledMean1Buf + poolBytesFP32;
+    aclTensor* scaledMean2Tensor = handle->tensorCache.get(scaledMean2Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    {
+      aclScalar* scaleScalar = aclCreateScalar(&scale2, ACL_FLOAT);
+      uint64_t mulsWsSize = 0;
+      aclOpExecutor* mulsExecutor = nullptr;
+      status = aclnnMulsGetWorkspaceSize(meanFP32Tensor, scaleScalar, scaledMean2Tensor, &mulsWsSize, &mulsExecutor);
+      if(status == ACLNN_SUCCESS && mulsWsSize <= workspaceBytes) {
+        status = aclnnMuls(workspaceBuf, mulsWsSize, mulsExecutor, stream);
+      }
+      aclDestroyScalar(scaleScalar);
+      if(status != ACLNN_SUCCESS) {
+        aclDestroyIntArray(outputSize);
+        throw StringError("aclnnMuls failed for value head scaledMean2: " + to_string(status));
+      }
+    }
+
+    // 3e: Concatenate [mean, scaledMean1, scaledMean2] along channel dimension
+    aclTensor* mean2D = handle->tensorCache.get(meanFP32Buf, {batchSize, v1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclTensor* scaledMean1_2D = handle->tensorCache.get(scaledMean1Buf, {batchSize, v1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclTensor* scaledMean2_2D = handle->tensorCache.get(scaledMean2Buf, {batchSize, v1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
+
+    aclTensor* tensorsForCat[3] = {mean2D, scaledMean1_2D, scaledMean2_2D};
+    aclTensorList* tensorList = aclCreateTensorList(tensorsForCat, 3);
+    if(!tensorList) {
+      aclDestroyIntArray(outputSize);
+      throw StringError("aclCreateTensorList failed for value head global pooling concat");
+    }
+
+    aclTensor* concatOut = handle->tensorCache.get(v1MeanBuf, {batchSize, v1Channels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
+    uint64_t catWsSize = 0;
+    aclOpExecutor* catExecutor = nullptr;
+    status = aclnnCatGetWorkspaceSize(tensorList, 1, concatOut, &catWsSize, &catExecutor);
+    if(status == ACLNN_SUCCESS && catWsSize <= workspaceBytes) {
+      status = aclnnCat(workspaceBuf, catWsSize, catExecutor, stream);
+    }
+    aclDestroyTensorList(tensorList);
     if(status != ACLNN_SUCCESS) {
       aclDestroyIntArray(outputSize);
-      throw StringError("aclnnAdaptiveMaxPool2d failed for value head max pooling: " + to_string(status));
-    }
-
-    // 3c: Compute scaledMean = mean * (sqrt(area) - 14) * 0.1
-    float sqrtArea = sqrtf((float)(nnXLen * nnYLen));
-    float scale = (sqrtArea - 14.0f) * 0.1f;
-    (void)scale; // TODO: Implement proper scalar multiplication
-
-    // 3d: Copy maxPool to v1MeanBuf + v1Channels offset
-    void* maxDstBuf = (char*)v1MeanBuf + (size_t)v1Channels * batchSize * sizeof(float);
-    aclTensor* maxDstTensor = handle->tensorCache.get(maxDstBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
-
-    uint64_t copyWsSize = 0;
-    aclOpExecutor* copyExecutor = nullptr;
-    status = aclnnInplaceCopyGetWorkspaceSize(maxDstTensor, maxPoolTensor, &copyWsSize, &copyExecutor);
-    if(status == ACLNN_SUCCESS && copyWsSize <= workspaceBytes) {
-      aclnnInplaceCopy(workspaceBuf, copyWsSize, copyExecutor, stream);
-    }
-
-    // 3e: For scaledMean, copy meanPool for now (simplified implementation)
-    void* scaledMeanBuf = (char*)v1MeanBuf + (size_t)v1Channels * 2 * batchSize * sizeof(float);
-    aclTensor* scaledMeanTensor = handle->tensorCache.get(scaledMeanBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
-
-    uint64_t copyWsSize2 = 0;
-    aclOpExecutor* copyExecutor2 = nullptr;
-    status = aclnnInplaceCopyGetWorkspaceSize(scaledMeanTensor, meanPoolTensor, &copyWsSize2, &copyExecutor2);
-    if(status == ACLNN_SUCCESS && copyWsSize2 <= workspaceBytes) {
-      aclnnInplaceCopy(workspaceBuf, copyWsSize2, copyExecutor2, stream);
+      throw StringError("aclnnCat failed for value head global pooling concat: " + to_string(status));
     }
 
     aclDestroyIntArray(outputSize);
   }
 
   // Step 4: Apply v2Mul: v1Mean -> v2Out
-  v2Mul->apply(handle, stream, batchSize, v1MeanBuf, v2OutBuf, workspaceBuf, workspaceBytes);
+  // CRITICAL: In FP16 mode, v1MeanBuf contains FP32 data from global pooling.
+  // MatMulLayer expects FP16 input, so we must convert FP32->FP16 first.
+  void* v1MeanInputBuf;  // Buffer to pass to MatMulLayer
+  if(useFP16) {
+    // Cast v1MeanBuf (FP32) -> v1MeanFP16Buf (FP16)
+    aclTensor* srcTensor = handle->tensorCache.get(v1MeanBuf, {batchSize, v1Channels*3}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclTensor* dstTensor = handle->tensorCache.get(buffers->v1MeanFP16Buf, {batchSize, v1Channels*3}, ACL_FLOAT16, ACL_FORMAT_ND);
+    uint64_t castWsSize = 0;
+    aclOpExecutor* castExecutor = nullptr;
+    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT16, dstTensor, &castWsSize, &castExecutor);
+    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+      status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+    }
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnCast failed for value head v1Mean FP32->FP16: " + to_string(status));
+    }
+    v1MeanInputBuf = buffers->v1MeanFP16Buf;
+  } else {
+    v1MeanInputBuf = v1MeanBuf;
+  }
+  v2Mul->apply(handle, stream, batchSize, v1MeanInputBuf, v2OutBuf, workspaceBuf, workspaceBytes);
 
   // Step 5: Apply v2Bias: v2Out -> v2Out (in-place)
   v2Bias->apply(handle, stream, batchSize, v2OutBuf, v2OutBuf, workspaceBuf, workspaceBytes);
