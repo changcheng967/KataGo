@@ -12,8 +12,8 @@
 #include "aclnn_add.h"
 #include "aclnn_mul.h"
 #include "aclnn_matmul.h"
-#include "aclnn_adaptive_avg_pool2d.h"
-#include "aclnnop/aclnn_adaptive_max_pool2d.h"
+// Removed: aclnn_adaptive_avg_pool2d.h - using aclnnMean instead
+// Removed: aclnnop/aclnn_adaptive_max_pool2d.h - using aclnnAmax instead
 #include "aclnnop/aclnn_amax.h"
 #include "aclnnop/aclnn_mean.h"
 #include "aclnn_cast.h"
