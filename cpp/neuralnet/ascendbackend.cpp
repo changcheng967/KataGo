@@ -14,6 +14,7 @@
 #include "aclnn_matmul.h"
 #include "aclnn_adaptive_avg_pool2d.h"
 #include "aclnnop/aclnn_adaptive_max_pool2d.h"
+#include "aclnnop/aclnn_amax.h"
 #include "aclnn_cast.h"
 #include "aclnn_fill_scalar.h"
 #include "aclnn_copy.h"
@@ -2154,23 +2155,26 @@ void Model::applyPolicyHead(
       throw StringError("aclnnAdaptiveAvgPool2d failed for policy head mean pooling: " + to_string(status));
     }
 
-    // 4b: Max pooling using aclnnAdaptiveMaxPool2d
+    // 4b: Max pooling using aclnnAmax (reduce max along H and W dimensions)
     // Output max after meanFP32Buf, using dtype (same as input for dtype matching)
     void* maxPoolBuf = (char*)meanFP32Buf + poolBytesFP32;  // [batch, g1Channels, 1, 1] in dtype
     void* maxFP32Buf = (char*)maxPoolBuf + poolBytesDtype;  // [batch, g1Channels, 1, 1] in FP32 (for concat)
-    aclTensor* maxPoolTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
-    // Use ACL_FORMAT_ND for INT64 indices tensor - NCHW format may not be fully supported for INT64 dtype
-    aclTensor* maxIndicesTensor = handle->tensorCache.get(maxIndicesBuf, {batchSize, g1Channels, 1, 1}, ACL_INT64, ACL_FORMAT_ND);
+    // Use ACL_FORMAT_ND for amax operation per API requirements
+    aclTensor* maxPoolTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_ND);
+    // Create dim array for reducing along H (dim 2) and W (dim 3)
+    aclIntArray* reduceDims = createAclIntArray({2, 3});
+    bool keepDim = true;
 
     uint64_t maxWsSize = 0;
     aclOpExecutor* maxExecutor = nullptr;
-    status = aclnnAdaptiveMaxPool2dGetWorkspaceSize(g1Out2Tensor, outputSize, maxPoolTensor, maxIndicesTensor, &maxWsSize, &maxExecutor);
+    status = aclnnAmaxGetWorkspaceSize(g1Out2Tensor, reduceDims, keepDim, maxPoolTensor, &maxWsSize, &maxExecutor);
     if(status == ACLNN_SUCCESS && maxWsSize <= workspaceBytes) {
-      status = aclnnAdaptiveMaxPool2d(workspaceBuf, maxWsSize, maxExecutor, stream);
+      status = aclnnAmax(workspaceBuf, maxWsSize, maxExecutor, stream);
     }
+    aclDestroyIntArray(reduceDims);
     if(status != ACLNN_SUCCESS) {
       aclDestroyIntArray(outputSize);
-      throw StringError("aclnnAdaptiveMaxPool2d failed for policy head max pooling: " + to_string(status));
+      throw StringError("aclnnAmax failed for policy head max pooling: " + to_string(status));
     }
 
     // 4c: Cast max to FP32 if needed (for concatenation)
