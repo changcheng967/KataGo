@@ -8,7 +8,6 @@
 // ACLNN operator headers (from aclnnop directory)
 // Note: inplace variants are declared in the same header as non-inplace
 #include "aclnn_convolution.h"
-#include "aclnnop/aclnn_conv2d.h"
 #include "aclnn_relu.h"
 #include "aclnn_add.h"
 #include "aclnn_mul.h"
