@@ -1118,7 +1118,19 @@ struct ConvLayer {
 
     if(status != ACLNN_SUCCESS) {
       for(aclTensor* t : localTensors) destroyAclTensor(t);
-      throw StringError("aclnnConvolutionGetWorkspaceSize failed for layer " + name + " with error: " + to_string(status));
+      throw StringError("aclnnConvolutionGetWorkspaceSize failed for layer " + name +
+        " with error: " + to_string(status) +
+        " batchSize=" + to_string(batchSize) +
+        " inChannels=" + to_string(inChannels) +
+        " outChannels=" + to_string(outChannels) +
+        " nnXLen=" + to_string(nnXLen) +
+        " nnYLen=" + to_string(nnYLen) +
+        " convYSize=" + to_string(convYSize) +
+        " convXSize=" + to_string(convXSize) +
+        " dilationY=" + to_string(dilationY) +
+        " dilationX=" + to_string(dilationX) +
+        " dtype=" + to_string((int)dtype) +
+        " cubeMathType=" + to_string((int)cubeMathType));
     }
 
     // Phase 2: Execute
