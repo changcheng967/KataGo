@@ -2540,7 +2540,7 @@ void Model::applyPolicyHead(
 
     uint64_t maxWsSize = 0;
     aclOpExecutor* maxExecutor = nullptr;
-    status = aclnnAmaxGetWorkspaceSize(g1Out2Tensor, reduceDims, keepDim, maxPoolTensor, &maxWsSize, &maxExecutor);
+    status = aclnnAmaxGetWorkspaceSize(g1Out2TensorND, reduceDims, keepDim, maxPoolTensor, &maxWsSize, &maxExecutor);
     if(status == ACLNN_SUCCESS && maxWsSize <= workspaceBytes) {
       status = aclnnAmax(workspaceBuf, maxWsSize, maxExecutor, stream);
     }
