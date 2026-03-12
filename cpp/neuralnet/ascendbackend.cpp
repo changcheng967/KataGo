@@ -872,10 +872,10 @@ struct Buffers {
       v1MeanFP16Buf = nullptr;
     }
 
-    // Allocate maxIndices buffer for global pooling (int32 for indices from max pooling)
+    // Allocate maxIndices buffer for global pooling (int64 for indices from max pooling)
     // Size: [max(g1Channels, valueHead.v1Conv.outChannels)] * batchSize
     size_t maxIndicesSize = (size_t)max(g1Channels, m.valueHead.v1Conv.outChannels) * maxBatchSize;
-    maxIndicesBuf = ascendMalloc(maxIndicesSize * sizeof(int32_t));
+    maxIndicesBuf = ascendMalloc(maxIndicesSize * sizeof(int64_t));
 
     // Allocate workspace
     workspaceBytes = extraWorkspace;
@@ -2159,7 +2159,8 @@ void Model::applyPolicyHead(
     void* maxPoolBuf = (char*)meanFP32Buf + poolBytesFP32;  // [batch, g1Channels, 1, 1] in dtype
     void* maxFP32Buf = (char*)maxPoolBuf + poolBytesDtype;  // [batch, g1Channels, 1, 1] in FP32 (for concat)
     aclTensor* maxPoolTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
-    aclTensor* maxIndicesTensor = handle->tensorCache.get(maxIndicesBuf, {batchSize, g1Channels, 1, 1}, ACL_INT32, ACL_FORMAT_NCHW);
+    // Use ACL_FORMAT_ND for INT64 indices tensor - NCHW format may not be fully supported for INT64 dtype
+    aclTensor* maxIndicesTensor = handle->tensorCache.get(maxIndicesBuf, {batchSize, g1Channels, 1, 1}, ACL_INT64, ACL_FORMAT_ND);
 
     uint64_t maxWsSize = 0;
     aclOpExecutor* maxExecutor = nullptr;
