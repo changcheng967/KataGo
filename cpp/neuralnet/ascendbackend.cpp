@@ -1369,13 +1369,15 @@ struct ConvLayer {
     vector<int64_t> weightTransStrides = {1, C_in};  // Swapped from [C_out, C_in]'s [C_in, 1]
 
     aclTensor* weightTransTensor = aclCreateTensor(
-      weightTransShape.data(), weightTransShape.size(),
-      dtype,
-      weightTransStrides.data(), weightTransStrides.size(),
-      0,  // storageOffset
-      ACL_FORMAT_ND,
-      weightTransShape.data(), weightTransShape.size(),
-      filterBuf  // same data, different view
+      weightTransShape.data(),                      // viewDims
+      static_cast<uint64_t>(weightTransShape.size()), // viewDimsNum
+      dtype,                                        // dataType
+      weightTransStrides.data(),                    // stride
+      static_cast<int64_t>(0),                      // offset
+      ACL_FORMAT_ND,                                // format
+      weightShape.data(),                           // storageDims (original physical layout)
+      static_cast<uint64_t>(weightShape.size()),    // storageDimsNum
+      filterBuf                                     // data
     );
     localTensors.push_back(weightTransTensor);
 
