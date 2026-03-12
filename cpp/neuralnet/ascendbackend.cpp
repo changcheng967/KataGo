@@ -1370,9 +1370,10 @@ struct ConvLayer {
 
     aclTensor* weightTransTensor = aclCreateTensor(
       weightTransShape.data(), weightTransShape.size(),
-      dtype, ACL_FORMAT_ND,
+      dtype,
       weightTransStrides.data(), weightTransStrides.size(),
-      0,  // offset
+      0,  // storageOffset
+      ACL_FORMAT_ND,
       weightTransShape.data(), weightTransShape.size(),
       filterBuf  // same data, different view
     );
