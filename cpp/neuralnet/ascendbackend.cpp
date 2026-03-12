@@ -2125,7 +2125,8 @@ void Model::applyPolicyHead(
   // Output format per CUDA: [mean, scaledMean, max] -> [batch, g1Channels * 3]
   // where scaledMean = mean * (sqrt(area) - 14) * 0.1
   {
-    void* maxIndicesBuf = buffers->maxIndicesBuf;
+    // Note: maxIndicesBuf from buffers is no longer used since we switched from
+    // aclnnAdaptiveMaxPool2d to aclnnAmax which doesn't require index output
     aclIntArray* outputSize = createAclIntArray({1, 1});
 
     // Use scratchBuf for intermediate pooling results
@@ -3144,12 +3145,9 @@ bool NeuralNet::testEvaluateBatchNorm(
   // Create BatchNormLayer
   BatchNormLayer* batchNormLayer = new BatchNormLayer(desc, &actDesc, nnXLen, nnYLen, useFP16);
 
-  // Get workspace size
-  size_t workspaceBytes = batchNormLayer->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen);
+  // BatchNormLayer doesn't need workspace in our implementation
   void* deviceWorkspace = nullptr;
-  if(workspaceBytes > 0) {
-    deviceWorkspace = ascendMalloc(workspaceBytes);
-  }
+  size_t workspaceBytes = 0;
 
   // Apply batch norm
   batchNormLayer->apply(nullptr, stream, batchSize, deviceInput, deviceMask, deviceOutput, deviceWorkspace, workspaceBytes);
@@ -3216,18 +3214,18 @@ bool NeuralNet::testEvaluateResidualBlock(
   // Create ResidualBlock
   ResidualBlock* residualBlock = new ResidualBlock(desc, nnXLen, nnYLen, useFP16);
 
-  // Get workspace size
-  size_t workspaceBytes = residualBlock->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen);
+  // Get workspace size (requires stream parameter)
+  size_t workspaceBytes = residualBlock->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream);
   void* deviceWorkspace = nullptr;
   if(workspaceBytes > 0) {
     deviceWorkspace = ascendMalloc(workspaceBytes);
   }
 
-  // Create scratch buffers (simplified for testing)
-  ScratchBuffers scratch(batchSize, nnXLen, nnYLen, useFP16);
+  // Create scratch buffers (needs maxWorkspaceNeeded parameter)
+  ScratchBuffers scratch(batchSize, nnXLen, nnYLen, useFP16, workspaceBytes);
 
-  // Apply residual block
-  residualBlock->apply(nullptr, stream, &scratch, batchSize, deviceInput, deviceScratch, deviceMask, deviceWorkspace, workspaceBytes);
+  // Apply residual block (takes 11 args including nnXLen, nnYLen and scratchBuf)
+  residualBlock->apply(nullptr, stream, batchSize, nnXLen, nnYLen, deviceMask, deviceInput, deviceScratch, deviceScratch, deviceWorkspace, workspaceBytes);
 
   // Synchronize
   ACL_CHECK(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
@@ -3283,37 +3281,54 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
   // Allocate device buffers
   void* deviceInput = ascendMalloc(numInputFloats * eltSize);
   void* deviceMask = ascendMalloc(numMaskFloats * eltSize);
-  void* deviceMaskFloat = ascendMalloc(numMaskFloats * sizeof(float));
-  void* deviceMaskSum = ascendMalloc(numMaskSumFloats * sizeof(float));
-  void* deviceScratch = ascendMalloc(numInputFloats * eltSize);
+  float* deviceMaskSum = (float*)ascendMalloc(numMaskSumFloats * sizeof(float));
+  void* deviceRegularOut = ascendMalloc(numOutputFloats * eltSize);
+  void* deviceGpoolOut = ascendMalloc(numInputFloats * eltSize);
+  void* deviceGpoolConcat = ascendMalloc((size_t)batchSize * desc->gpoolConv.outChannels * 3 * sizeof(float));
+  void* deviceGpoolBias = ascendMalloc(numOutputFloats * eltSize);
 
   // Copy inputs to device
   ascendCopyH2D(deviceInput, inputBuffer.data(), numInputFloats * sizeof(float));
   ascendCopyH2D(deviceMask, maskBuffer.data(), numMaskFloats * sizeof(float));
 
-  // Fill mask float and mask sum buffers
-  fillMaskFloatBufAndMaskSumBuf(deviceMask, deviceMaskFloat, deviceMaskSum, useFP16, batchSize, nnXLen, nnYLen);
-
-  // Create ScratchBuffers
-  ScratchBuffers scratch(batchSize, nnXLen, nnYLen, useFP16);
+  // Compute mask sum on host and copy to device (simplified for testing)
+  vector<float> maskSumHost(batchSize, 0.0f);
+  for(int n = 0; n < batchSize; n++) {
+    for(int y = 0; y < nnYLen; y++) {
+      for(int x = 0; x < nnXLen; x++) {
+        int idx = n * nnXLen * nnYLen + y * nnXLen + x;
+        maskSumHost[n] += maskBuffer[idx];
+      }
+    }
+  }
+  ACL_CHECK(aclrtMemcpy(deviceMaskSum, numMaskSumFloats * sizeof(float),
+                        maskSumHost.data(), numMaskSumFloats * sizeof(float),
+                        ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy maskSum");
 
   // Create GlobalPoolingResidualBlock
   GlobalPoolingResidualBlock* residualBlock = new GlobalPoolingResidualBlock(desc, nnXLen, nnYLen, useFP16);
 
-  // Get workspace size
-  size_t workspaceBytes = residualBlock->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen);
+  // Get workspace size (takes only batchSize and stream)
+  size_t workspaceBytes = residualBlock->requiredWorkspaceBytes(batchSize, stream);
   void* deviceWorkspace = nullptr;
   if(workspaceBytes > 0) {
     deviceWorkspace = ascendMalloc(workspaceBytes);
   }
 
   // Apply global pooling residual block
-  residualBlock->apply(nullptr, stream, &scratch, batchSize, deviceInput, deviceScratch, deviceMask, deviceMaskSum, deviceWorkspace, workspaceBytes);
+  // apply(ComputeHandle* handle, aclrtStream stream, int batchSize,
+  //       const void* maskBuf, const float* maskSumBuf, void* inputBuf,
+  //       void* regularOutBuf, void* gpoolOutBuf, void* gpoolConcatBuf,
+  //       void* gpoolBiasBuf, void* workspaceBuf, size_t workspaceBytes)
+  residualBlock->apply(nullptr, stream, batchSize, deviceMask, deviceMaskSum,
+                       deviceInput, deviceRegularOut, deviceGpoolOut,
+                       deviceGpoolConcat, deviceGpoolBias,
+                       deviceWorkspace, workspaceBytes);
 
   // Synchronize
   ACL_CHECK(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
 
-  // Copy output back to host
+  // Copy output back to host (output is in deviceInput after residual add)
   outputBuffer.resize(numOutputFloats);
   ascendCopyD2H(outputBuffer.data(), deviceInput, numOutputFloats * sizeof(float));
 
@@ -3321,9 +3336,11 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
   ascendFree(deviceWorkspace);
   ascendFree(deviceInput);
   ascendFree(deviceMask);
-  ascendFree(deviceMaskFloat);
   ascendFree(deviceMaskSum);
-  ascendFree(deviceScratch);
+  ascendFree(deviceRegularOut);
+  ascendFree(deviceGpoolOut);
+  ascendFree(deviceGpoolConcat);
+  ascendFree(deviceGpoolBias);
   delete residualBlock;
   ACL_CHECK(aclrtDestroyStream(stream), "aclrtDestroyStream");
 
