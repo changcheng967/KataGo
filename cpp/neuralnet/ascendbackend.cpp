@@ -978,7 +978,7 @@ struct ConvLayer {
     if(useFP16) {
       filterBuf = ascendMallocAndCopyFP16(desc->weights.data(), desc->weights.size());
       dtype = ACL_FLOAT16;
-      cubeMathType = 0;  // KEEP_DTYPE - weights are already native FP16
+      cubeMathType = 1;  // ALLOW_FP32_DOWN_PRECISION - more compatible than KEEP_DTYPE
     } else {
       size_t weightBytes = desc->weights.size() * sizeof(float);
       filterBuf = ascendMallocAndCopy(desc->weights.data(), weightBytes);
