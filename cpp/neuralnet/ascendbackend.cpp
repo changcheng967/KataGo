@@ -1367,6 +1367,7 @@ struct ConvLayer {
     // Create transposed weight view
     vector<int64_t> weightTransShape = {C_in, C_out};
     vector<int64_t> weightTransStrides = {1, C_in};  // Swapped from [C_out, C_in]'s [C_in, 1]
+    vector<int64_t> weightStorageShape = {C_out, C_in};  // Original physical layout
 
     aclTensor* weightTransTensor = aclCreateTensor(
       weightTransShape.data(),                      // viewDims
@@ -1375,8 +1376,8 @@ struct ConvLayer {
       weightTransStrides.data(),                    // stride
       static_cast<int64_t>(0),                      // offset
       ACL_FORMAT_ND,                                // format
-      weightShape.data(),                           // storageDims (original physical layout)
-      static_cast<uint64_t>(weightShape.size()),    // storageDimsNum
+      weightStorageShape.data(),                    // storageDims (original physical layout)
+      static_cast<uint64_t>(weightStorageShape.size()), // storageDimsNum
       filterBuf                                     // data
     );
     localTensors.push_back(weightTransTensor);
