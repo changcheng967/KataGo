@@ -15,6 +15,7 @@
 #include "aclnn_adaptive_avg_pool2d.h"
 #include "aclnnop/aclnn_adaptive_max_pool2d.h"
 #include "aclnnop/aclnn_amax.h"
+#include "aclnnop/aclnn_mean.h"
 #include "aclnn_cast.h"
 #include "aclnn_fill_scalar.h"
 #include "aclnn_copy.h"
@@ -2507,19 +2508,24 @@ void Model::applyPolicyHead(
     // FP32 mean buffer (for concatenation): comes after meanPoolBuf
     void* meanFP32Buf = (char*)scratchBuf + poolBytesDtype;  // [batch, g1Channels, 1, 1] in FP32
 
-    // 4a: Mean pooling using aclnnAdaptiveAvgPool2d
-    aclTensor* g1Out2Tensor = handle->tensorCache.get(g1Out2Buf, {batchSize, g1Channels, nnYLen, nnXLen}, dtype, ACL_FORMAT_NCHW);
-    aclTensor* meanPoolTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
+    // 4a: Mean pooling using aclnnMean (reduce along H and W dimensions)
+    // Use ACL_FORMAT_ND for aclnnMean per API requirements
+    aclTensor* g1Out2TensorND = handle->tensorCache.get(g1Out2Buf, {batchSize, g1Channels, nnYLen, nnXLen}, dtype, ACL_FORMAT_ND);
+    aclTensor* meanPoolTensorND = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_ND);
+
+    aclIntArray* meanReduceDims = createAclIntArray({2, 3});
+    bool meanKeepDim = true;
 
     uint64_t meanWsSize = 0;
     aclOpExecutor* meanExecutor = nullptr;
-    aclnnStatus status = aclnnAdaptiveAvgPool2dGetWorkspaceSize(g1Out2Tensor, outputSize, meanPoolTensor, &meanWsSize, &meanExecutor);
+    aclnnStatus status = aclnnMeanGetWorkspaceSize(g1Out2TensorND, meanReduceDims, meanKeepDim, dtype, meanPoolTensorND, &meanWsSize, &meanExecutor);
     if(status == ACLNN_SUCCESS && meanWsSize <= workspaceBytes) {
-      status = aclnnAdaptiveAvgPool2d(workspaceBuf, meanWsSize, meanExecutor, stream);
+      status = aclnnMean(workspaceBuf, meanWsSize, meanExecutor, stream);
     }
+    aclDestroyIntArray(meanReduceDims);
     if(status != ACLNN_SUCCESS) {
       aclDestroyIntArray(outputSize);
-      throw StringError("aclnnAdaptiveAvgPool2d failed for policy head mean pooling: " + to_string(status));
+      throw StringError("aclnnMean failed for policy head mean pooling: " + to_string(status));
     }
 
     // 4b: Max pooling using aclnnAmax (reduce max along H and W dimensions)
@@ -2799,18 +2805,24 @@ void Model::applyValueHead(
     void* meanPoolBuf = scratchBuf;  // [batch, v1Channels, 1, 1] in input dtype
     void* meanFP32Buf = (char*)scratchBuf + poolBytesDtype;  // [batch, v1Channels, 1, 1] in FP32
 
-    // 3a: Mean pooling using aclnnAdaptiveAvgPool2d
-    aclTensor* v1Out2Tensor = handle->tensorCache.get(v1Out2Buf, {batchSize, v1Channels, nnYLen, nnXLen}, dtype, ACL_FORMAT_NCHW);
-    aclTensor* meanPoolTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
+    // 3a: Mean pooling using aclnnMean (reduce along H and W dimensions)
+    // Use ACL_FORMAT_ND for aclnnMean per API requirements
+    aclTensor* v1Out2TensorND = handle->tensorCache.get(v1Out2Buf, {batchSize, v1Channels, nnYLen, nnXLen}, dtype, ACL_FORMAT_ND);
+    aclTensor* meanPoolTensorND = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, dtype, ACL_FORMAT_ND);
+
+    aclIntArray* meanReduceDims = createAclIntArray({2, 3});
+    bool meanKeepDim = true;
+
     uint64_t meanWsSize = 0;
     aclOpExecutor* meanExecutor = nullptr;
-    aclnnStatus status = aclnnAdaptiveAvgPool2dGetWorkspaceSize(v1Out2Tensor, outputSize, meanPoolTensor, &meanWsSize, &meanExecutor);
+    aclnnStatus status = aclnnMeanGetWorkspaceSize(v1Out2TensorND, meanReduceDims, meanKeepDim, dtype, meanPoolTensorND, &meanWsSize, &meanExecutor);
     if(status == ACLNN_SUCCESS && meanWsSize <= workspaceBytes) {
-      status = aclnnAdaptiveAvgPool2d(workspaceBuf, meanWsSize, meanExecutor, stream);
+      status = aclnnMean(workspaceBuf, meanWsSize, meanExecutor, stream);
     }
+    aclDestroyIntArray(meanReduceDims);
     if(status != ACLNN_SUCCESS) {
       aclDestroyIntArray(outputSize);
-      throw StringError("aclnnAdaptiveAvgPool2d failed for value head mean pooling: " + to_string(status));
+      throw StringError("aclnnMean failed for value head mean pooling: " + to_string(status));
     }
 
     // 3b: Cast mean to FP32 if needed
