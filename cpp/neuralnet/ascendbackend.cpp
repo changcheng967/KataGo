@@ -3098,17 +3098,78 @@ bool NeuralNet::testEvaluateBatchNorm(
   const vector<float>& maskBuffer,
   vector<float>& outputBuffer
 ) {
-  (void)desc;
-  (void)batchSize;
-  (void)nnXLen;
-  (void)nnYLen;
-  (void)useFP16;
-  (void)useNHWC;
-  (void)inputBuffer;
-  (void)maskBuffer;
-  (void)outputBuffer;
+  (void)useNHWC; // We always use NCHW internally
 
-  return false; // Not implemented yet
+  size_t numInputFloats = (size_t)batchSize * nnXLen * nnYLen * desc->numChannels;
+  size_t numMaskFloats = (size_t)batchSize * nnXLen * nnYLen;
+  size_t numOutputFloats = (size_t)batchSize * nnXLen * nnYLen * desc->numChannels;
+
+  if(numInputFloats != inputBuffer.size()) {
+    throw StringError("testEvaluateBatchNorm: unexpected input buffer size");
+  }
+  if(numMaskFloats != maskBuffer.size()) {
+    throw StringError("testEvaluateBatchNorm: unexpected mask buffer size");
+  }
+
+  // Set device
+  ACL_CHECK(aclrtSetDevice(0), "aclrtSetDevice");
+
+  // Create stream
+  aclrtStream stream;
+  ACL_CHECK(aclrtCreateStream(&stream), "aclrtCreateStream");
+
+  // Create activation descriptor (identity for testing)
+  ActivationLayerDesc actDesc;
+  actDesc.activation = ACTIVATION_IDENTITY;
+
+  // Allocate device buffers
+  aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+  size_t inputBytes = numInputFloats * (useFP16 ? sizeof(aclFloat16) : sizeof(float));
+  size_t maskBytes = numMaskFloats * (useFP16 ? sizeof(aclFloat16) : sizeof(float));
+  size_t outputBytes = numOutputFloats * (useFP16 ? sizeof(aclFloat16) : sizeof(float));
+
+  void* deviceInput = ascendMalloc(inputBytes);
+  void* deviceMask = ascendMalloc(maskBytes);
+  void* deviceOutput = ascendMalloc(outputBytes);
+
+  // Copy inputs to device (with FP16 conversion if needed)
+  if(useFP16) {
+    ascendCopyH2D(deviceInput, inputBuffer.data(), numInputFloats * sizeof(float));
+    ascendCopyH2D(deviceMask, maskBuffer.data(), numMaskFloats * sizeof(float));
+  } else {
+    ascendCopyH2D(deviceInput, inputBuffer.data(), inputBytes);
+    ascendCopyH2D(deviceMask, maskBuffer.data(), maskBytes);
+  }
+
+  // Create BatchNormLayer
+  BatchNormLayer* batchNormLayer = new BatchNormLayer(desc, &actDesc, nnXLen, nnYLen, useFP16);
+
+  // Get workspace size
+  size_t workspaceBytes = batchNormLayer->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen);
+  void* deviceWorkspace = nullptr;
+  if(workspaceBytes > 0) {
+    deviceWorkspace = ascendMalloc(workspaceBytes);
+  }
+
+  // Apply batch norm
+  batchNormLayer->apply(nullptr, stream, batchSize, deviceInput, deviceMask, deviceOutput, deviceWorkspace, workspaceBytes);
+
+  // Synchronize
+  ACL_CHECK(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
+
+  // Copy output back to host
+  outputBuffer.resize(numOutputFloats);
+  ascendCopyD2H(outputBuffer.data(), deviceOutput, numOutputFloats * sizeof(float));
+
+  // Cleanup
+  ascendFree(deviceWorkspace);
+  ascendFree(deviceInput);
+  ascendFree(deviceMask);
+  ascendFree(deviceOutput);
+  delete batchNormLayer;
+  ACL_CHECK(aclrtDestroyStream(stream), "aclrtDestroyStream");
+
+  return true;
 }
 
 bool NeuralNet::testEvaluateResidualBlock(
@@ -3122,17 +3183,68 @@ bool NeuralNet::testEvaluateResidualBlock(
   const vector<float>& maskBuffer,
   vector<float>& outputBuffer
 ) {
-  (void)desc;
-  (void)batchSize;
-  (void)nnXLen;
-  (void)nnYLen;
-  (void)useFP16;
-  (void)useNHWC;
-  (void)inputBuffer;
-  (void)maskBuffer;
-  (void)outputBuffer;
+  (void)useNHWC; // We always use NCHW internally
 
-  return false; // Not implemented yet
+  size_t numInputFloats = (size_t)batchSize * nnXLen * nnYLen * desc->preBN.numChannels;
+  size_t numMaskFloats = (size_t)batchSize * nnXLen * nnYLen;
+  size_t numOutputFloats = (size_t)batchSize * nnXLen * nnYLen * desc->finalConv.outChannels;
+
+  if(numInputFloats != inputBuffer.size())
+    throw StringError("testEvaluateResidualBlock: unexpected input buffer size");
+  if(numMaskFloats != maskBuffer.size())
+    throw StringError("testEvaluateResidualBlock: unexpected mask buffer size");
+
+  // Set device
+  ACL_CHECK(aclrtSetDevice(0), "aclrtSetDevice");
+
+  // Create stream
+  aclrtStream stream;
+  ACL_CHECK(aclrtCreateStream(&stream), "aclrtCreateStream");
+
+  aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+  size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
+
+  // Allocate device buffers
+  void* deviceInput = ascendMalloc(numInputFloats * eltSize);
+  void* deviceMask = ascendMalloc(numMaskFloats * eltSize);
+  void* deviceScratch = ascendMalloc(numInputFloats * eltSize);
+
+  // Copy inputs to device
+  ascendCopyH2D(deviceInput, inputBuffer.data(), numInputFloats * sizeof(float));
+  ascendCopyH2D(deviceMask, maskBuffer.data(), numMaskFloats * sizeof(float));
+
+  // Create ResidualBlock
+  ResidualBlock* residualBlock = new ResidualBlock(desc, nnXLen, nnYLen, useFP16);
+
+  // Get workspace size
+  size_t workspaceBytes = residualBlock->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen);
+  void* deviceWorkspace = nullptr;
+  if(workspaceBytes > 0) {
+    deviceWorkspace = ascendMalloc(workspaceBytes);
+  }
+
+  // Create scratch buffers (simplified for testing)
+  ScratchBuffers scratch(batchSize, nnXLen, nnYLen, useFP16);
+
+  // Apply residual block
+  residualBlock->apply(nullptr, stream, &scratch, batchSize, deviceInput, deviceScratch, deviceMask, deviceWorkspace, workspaceBytes);
+
+  // Synchronize
+  ACL_CHECK(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
+
+  // Copy output back to host
+  outputBuffer.resize(numOutputFloats);
+  ascendCopyD2H(outputBuffer.data(), deviceInput, numOutputFloats * sizeof(float));
+
+  // Cleanup
+  ascendFree(deviceWorkspace);
+  ascendFree(deviceInput);
+  ascendFree(deviceMask);
+  ascendFree(deviceScratch);
+  delete residualBlock;
+  ACL_CHECK(aclrtDestroyStream(stream), "aclrtDestroyStream");
+
+  return true;
 }
 
 bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
@@ -3146,17 +3258,76 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
   const vector<float>& maskBuffer,
   vector<float>& outputBuffer
 ) {
-  (void)desc;
-  (void)batchSize;
-  (void)nnXLen;
-  (void)nnYLen;
-  (void)useFP16;
-  (void)useNHWC;
-  (void)inputBuffer;
-  (void)maskBuffer;
-  (void)outputBuffer;
+  (void)useNHWC; // We always use NCHW internally
 
-  return false; // Not implemented yet
+  size_t numInputFloats = (size_t)batchSize * nnXLen * nnYLen * desc->preBN.numChannels;
+  size_t numMaskFloats = (size_t)batchSize * nnXLen * nnYLen;
+  size_t numMaskSumFloats = (size_t)batchSize;
+  size_t numOutputFloats = (size_t)batchSize * nnXLen * nnYLen * desc->finalConv.outChannels;
+
+  if(numInputFloats != inputBuffer.size())
+    throw StringError("testEvaluateGlobalPoolingResidualBlock: unexpected input buffer size");
+  if(numMaskFloats != maskBuffer.size())
+    throw StringError("testEvaluateGlobalPoolingResidualBlock: unexpected mask buffer size");
+
+  // Set device
+  ACL_CHECK(aclrtSetDevice(0), "aclrtSetDevice");
+
+  // Create stream
+  aclrtStream stream;
+  ACL_CHECK(aclrtCreateStream(&stream), "aclrtCreateStream");
+
+  aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+  size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
+
+  // Allocate device buffers
+  void* deviceInput = ascendMalloc(numInputFloats * eltSize);
+  void* deviceMask = ascendMalloc(numMaskFloats * eltSize);
+  void* deviceMaskFloat = ascendMalloc(numMaskFloats * sizeof(float));
+  void* deviceMaskSum = ascendMalloc(numMaskSumFloats * sizeof(float));
+  void* deviceScratch = ascendMalloc(numInputFloats * eltSize);
+
+  // Copy inputs to device
+  ascendCopyH2D(deviceInput, inputBuffer.data(), numInputFloats * sizeof(float));
+  ascendCopyH2D(deviceMask, maskBuffer.data(), numMaskFloats * sizeof(float));
+
+  // Fill mask float and mask sum buffers
+  fillMaskFloatBufAndMaskSumBuf(deviceMask, deviceMaskFloat, deviceMaskSum, useFP16, batchSize, nnXLen, nnYLen);
+
+  // Create ScratchBuffers
+  ScratchBuffers scratch(batchSize, nnXLen, nnYLen, useFP16);
+
+  // Create GlobalPoolingResidualBlock
+  GlobalPoolingResidualBlock* residualBlock = new GlobalPoolingResidualBlock(desc, nnXLen, nnYLen, useFP16);
+
+  // Get workspace size
+  size_t workspaceBytes = residualBlock->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen);
+  void* deviceWorkspace = nullptr;
+  if(workspaceBytes > 0) {
+    deviceWorkspace = ascendMalloc(workspaceBytes);
+  }
+
+  // Apply global pooling residual block
+  residualBlock->apply(nullptr, stream, &scratch, batchSize, deviceInput, deviceScratch, deviceMask, deviceMaskSum, deviceWorkspace, workspaceBytes);
+
+  // Synchronize
+  ACL_CHECK(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
+
+  // Copy output back to host
+  outputBuffer.resize(numOutputFloats);
+  ascendCopyD2H(outputBuffer.data(), deviceInput, numOutputFloats * sizeof(float));
+
+  // Cleanup
+  ascendFree(deviceWorkspace);
+  ascendFree(deviceInput);
+  ascendFree(deviceMask);
+  ascendFree(deviceMaskFloat);
+  ascendFree(deviceMaskSum);
+  ascendFree(deviceScratch);
+  delete residualBlock;
+  ACL_CHECK(aclrtDestroyStream(stream), "aclrtDestroyStream");
+
+  return true;
 }
 
 #endif // USE_ASCEND_BACKEND
